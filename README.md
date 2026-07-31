@@ -10,21 +10,38 @@ Findings, measurements and the quality trade-offs live in
 
 ## Quickstart
 
-Three commands. Replace `your.mp4` with a real clip.
+Calibrate once per watermark **type**, then reuse that preset forever. Keep one
+preset per mark — `fanza.json`, `ippa.json` — because a preset is only valid for
+the watermark it was measured on.
 
 ```bash
 source .venv/bin/activate        # every session
 
-# 1. calibrate ONCE. Writes wm-preset.json. Processes no video.
+# 1. measure the box. Auto-detect is a starting guess, not an oracle:
 wmrm detect your.mp4 --corner tr --preset wm-preset.json
+#    ...or skip it and read the coordinates off a grid (always works):
+wmrm grid your.mp4 --corner tr
 
-# 2. open your-preview-zoom.png and check the red box covers the whole watermark
+# 2. confirm the box really covers the whole mark
+wmrm coverage your.mp4 --box 1554,44,284,62      # objective check
+wmrm run your.mp4 --box 1554,44,284,62 --preview-only   # and look at the PNG
 
-# 3. process
-wmrm run your.mp4 --preset wm-preset.json     # -> your-clean.mp4
+# 3. freeze it, then process
+wmrm detect your.mp4 --box 1554,44,284,62 --preset wm-preset.json
+wmrm run your.mp4 --preset wm-preset.json        # -> your-clean.mp4
 ```
 
-After step 1 you never need `detect` again — reuse `wm-preset.json` forever.
+**Do not trust auto-detect across watermark types.** It looks for pixel-locked
+*edges*, which finds a semi-transparent mark and completely misses opaque
+white-text-on-white-wall — measured: on such a clip it found nothing at all, and
+on a real one it found a single glyph of a five-letter logo. `wmrm grid` +
+`wmrm coverage` is the reliable path and takes about two minutes.
+
+Whole folder, once you have a preset:
+
+```bash
+wmrm batch ./inbox --preset wm-preset.json    # skips files already done
+```
 
 Whole folder:
 
@@ -132,7 +149,9 @@ Install notes, all deliberate:
 
 | | |
 | --- | --- |
-| `wmrm detect IN` | find the watermark, write a preset + preview PNGs. Processes nothing. |
+| `wmrm grid IN` | frame + coordinate grid, to measure the box by hand. Always works. |
+| `wmrm coverage IN --box ...` | check a box covers the whole mark. Watermark-agnostic. |
+| `wmrm detect IN` | guess the box and write a preset + preview PNGs. Processes nothing. `--box` freezes coordinates you measured yourself. |
 | `wmrm run IN [-o OUT]` | process one video. Default output `IN-clean.EXT`. |
 | `wmrm batch DIR` | process every video in a directory, skipping finished ones. |
 | `wmrm verify ORIG OUT` | re-run the acceptance checks on an existing pair. |
@@ -200,24 +219,31 @@ variation is invented. `--patch-hold N` converts boiling into freezing rather
 than fixing it; treat it as a speed lever. A real fix needs ProPainter or E2FGVI
 on a GPU (REPORT.md §5, phase 2).
 
-**Detection is good but not perfect — always look at the preview.** The gradient
-threshold is swept automatically (10 down to 1.5) and the largest stable box under
-the size limits wins, which is what lets it catch a faint mark next to a bold one.
-Measured against known ground truth:
+**Auto-detect breaks when the watermark changes.** It searches for pixel-locked
+*edges*, which is the right signal for some marks and useless for others. Measured
+against known ground truth:
 
 | case | true box | detected | verdict |
 | --- | --- | --- | --- |
-| real 1080p, two marks side by side | `1554,44,284,62` (measured by hand) | `1554,44,283,64` | correct |
+| two semi-transparent marks side by side, 1080p | `1554,44,284,62` | `1554,44,283,64` | correct |
 | badge on soft sky | `384,12,84,36` | `364,0,108,68` | over-covers — safe |
 | badge on sky, handheld | `384,12,84,36` | `377,4,99,51` | over-covers — safe |
-| **badge on dense texture** | `384,430,84,36` | `377,448,96,27` | **under-covers vertically** |
+| badge on dense texture | `384,430,84,36` | `377,448,96,27` | under-covers |
+| **opaque white text on a white wall** | — | **nothing found** | **total failure** |
 
-Over-covering is harmless (a little slower, a few clean pixels repainted).
-Under-covering leaves residue, and it still happens on dense texture, where only
-the high-contrast part of the mark registers. `detect` warns when the box comes
-out oddly elongated, but that check does not catch every case — **the preview is
-the real safety net.** Calibrate on a clip with a calmer background, or measure
-the box by hand.
+Over-covering is harmless (slightly slower, a few clean pixels repainted).
+Under-covering leaves residue. The last row is the one that matters: a different
+watermark style can defeat the detector completely, so **treat `detect` as a first
+guess and confirm with `wmrm coverage` + the preview**, or skip it and use
+`wmrm grid`.
+
+`wmrm coverage` is the objective guard, and it is watermark-agnostic because it
+uses two signals: pixel-locked edges *and* collapsed temporal variance (an opaque
+overlay freezes what is under it). Measured: from a box 160 px too small,
+iterating its suggestion converged to 16 px too small — a big improvement, not a
+guarantee. It reports `INCONCLUSIVE` rather than guessing when the background is
+itself static (fixed camera on a plain wall), because then no statistic can
+separate mark from wall.
 
 **Do not pick a backend by PSNR.** It rewards blur — a smear scored *higher* than
 a visibly better reconstruction. Judge with your eyes.

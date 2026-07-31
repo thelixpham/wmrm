@@ -225,6 +225,72 @@ def cmd_batch(args) -> int:
     return 0
 
 
+def cmd_grid(args) -> int:
+    """Dump a frame with a labelled coordinate grid, for measuring by hand.
+
+    Detection cannot be trusted across watermark types -- gradient-based search
+    finds a semi-transparent mark and completely misses opaque white-on-white
+    text. Measuring once by hand always works, so make that the easy path.
+    """
+    import subprocess
+
+    from .probe import require_tools
+
+    src = Path(args.input)
+    if not src.exists():
+        raise SystemExit(f"error: {src} not found")
+    ffmpeg, _ = require_tools()
+    info = probe(src)
+    out = Path(args.output) if args.output else src.with_name(f"{src.stem}-grid.png")
+
+    step, scale = args.step, args.scale
+    if args.corner:
+        cw, ch = int(info.width * args.frac), int(info.height * args.frac)
+        cx = 0 if args.corner in ("tl", "bl") else info.width - cw
+        cy = 0 if args.corner in ("tl", "tr") else info.height - ch
+    else:
+        cx, cy, cw, ch = 0, 0, info.width, info.height
+
+    at = args.at if args.at is not None else max(0.0, info.duration / 2)
+    # Grid spacing is multiplied by `scale` so lines land on multiples of `step`
+    # in *source* pixels after the zoom, which is what makes them readable.
+    vf = (f"crop={cw}:{ch}:{cx}:{cy},scale=iw*{scale}:ih*{scale}:flags=neighbor,"
+          f"drawgrid=w={step * scale}:h={step * scale}:t=1:c=red@0.7")
+    res = subprocess.run(
+        [ffmpeg, "-y", "-v", "error", "-nostdin", "-ss", f"{at:.3f}", "-i", str(src),
+         "-vf", vf, "-frames:v", "1", str(out)],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        raise SystemExit(f"error: ffmpeg failed:\n{res.stderr[:600]}")
+
+    print(f"grid written -> {out}")
+    print(f"video        : {info.width}x{info.height}")
+    print(f"crop origin  : x={cx} y={cy}  (add these to what you read off the grid)")
+    print(f"grid spacing : {step} source px, image zoomed {scale}x")
+    print("\nRead the watermark's left/top/right/bottom off the gridlines, then:")
+    print(f"  wmrm coverage {src} --box X,Y,W,H     # confirms nothing is left outside")
+    return 0
+
+
+def cmd_coverage(args) -> int:
+    from .coverage import check_coverage
+
+    src = Path(args.input)
+    if not src.exists():
+        raise SystemExit(f"error: {src} not found")
+    info = probe(src)
+    box, _ = _resolve_region(args, info.width, info.height)
+    result = check_coverage(src, box, samples=args.samples, ring=args.ring,
+                            grad_threshold=args.grad_threshold)
+    print(result.describe())
+    if not result.ok and result.suggested:
+        s = result.suggested
+        print(f"\nre-check with:\n  wmrm coverage {src} "
+              f"--box {s.x},{s.y},{s.w},{s.h}")
+    return 0 if result.ok else 1
+
+
 def cmd_verify(args) -> int:
     orig, proc = Path(args.original), Path(args.processed)
     info = probe(orig)
@@ -323,6 +389,33 @@ def build_parser() -> argparse.ArgumentParser:
     _add_region_args(b)
     _add_run_args(b)
     b.set_defaults(func=cmd_batch, preview_only=False)
+
+    g = sub.add_parser("grid", help="dump a frame with a coordinate grid, to measure by hand")
+    g.add_argument("input")
+    g.add_argument("-o", "--output", help="default: NAME-grid.png")
+    g.add_argument("--corner", choices=CORNERS, default="tr",
+                   help="zoom into this corner (default tr). Pass --frac 1 for the "
+                        "whole frame")
+    g.add_argument("--frac", type=float, default=0.30,
+                   help="corner size as a fraction of the frame (default 0.30)")
+    g.add_argument("--step", type=int, default=25,
+                   help="gridline spacing in source pixels (default 25)")
+    g.add_argument("--scale", type=int, default=3, help="zoom factor (default 3)")
+    g.add_argument("--at", type=float, default=None,
+                   help="timestamp in seconds (default: middle of the clip)")
+    g.set_defaults(func=cmd_grid)
+
+    c = sub.add_parser("coverage",
+                       help="check a box covers the whole watermark (any type)")
+    c.add_argument("input")
+    c.add_argument("--samples", type=int, default=30,
+                   help="frames sampled across the clip (default 30)")
+    c.add_argument("--ring", type=int, default=48,
+                   help="how far outside the box to look, in px (default 48)")
+    c.add_argument("--grad-threshold", type=float, default=2.0,
+                   help="edge threshold for the gradient signal (default 2)")
+    _add_region_args(c)
+    c.set_defaults(func=cmd_coverage)
 
     v = sub.add_parser("verify", help="compare an original and a processed file")
     v.add_argument("original")
