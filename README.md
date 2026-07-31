@@ -8,67 +8,124 @@ Findings, measurements and the quality trade-offs live in
 
 ---
 
-## Quickstart
+## If you only read one section
 
-Calibrate once per watermark **type**, then reuse that preset forever. Keep one
-preset per mark — `fanza.json`, `ippa.json` — because a preset is only valid for
-the watermark it was measured on.
-
-```bash
-source .venv/bin/activate        # every session
-
-# 1. measure the box. Auto-detect is a starting guess, not an oracle:
-wmrm detect your.mp4 --corner tr --preset wm-preset.json
-#    ...or skip it and read the coordinates off a grid (always works):
-wmrm grid your.mp4 --corner tr
-
-# 2. confirm the box really covers the whole mark
-wmrm coverage your.mp4 --box 1554,44,284,62      # objective check
-wmrm run your.mp4 --box 1554,44,284,62 --preview-only   # and look at the PNG
-
-# 3. freeze it, then process
-wmrm detect your.mp4 --box 1554,44,284,62 --preset wm-preset.json
-wmrm run your.mp4 --preset wm-preset.json        # -> your-clean.mp4
-```
-
-**Do not trust auto-detect across watermark types.** It looks for pixel-locked
-*edges*, which finds a semi-transparent mark and completely misses opaque
-white-text-on-white-wall — measured: on such a clip it found nothing at all, and
-on a real one it found a single glyph of a five-letter logo. `wmrm grid` +
-`wmrm coverage` is the reliable path and takes about two minutes.
-
-Whole folder, once you have a preset:
+**Every day — one command.** Drop videos in a folder, point at the preset for
+that watermark:
 
 ```bash
-wmrm batch ./inbox --preset wm-preset.json    # skips files already done
+wmrm batch ./inbox --preset fanza.json
 ```
 
-Whole folder:
+That already uses the best backend (LaMa). On a GPU box, never pass `--quality` —
+there is nothing to trade away. `--quality fast` exists only for CPU-bound
+machines, where LaMa costs about 22 minutes per minute of 1080p video.
+
+**A watermark you have never handled before — three commands, once.** After this
+you are back to the one-liner above, forever.
 
 ```bash
-wmrm batch ./inbox --preset wm-preset.json    # skips files already done
+wmrm grid new.mp4 --corner tr                          # read X,Y,W,H off the grid
+wmrm run new.mp4 --box X,Y,W,H --preview-only          # confirm the box by eye
+wmrm detect new.mp4 --box X,Y,W,H --preset newmark.json    # save it
 ```
 
-**If the box in step 2 is wrong**, measure it yourself and freeze that instead.
-Detection still under-covers on dense texture, so check the preview every time:
+**Everything else in this file is for when something looks wrong.** Skip it until
+it does.
+
+Two rules that cover most mistakes:
+
+- One preset per watermark **design**, named after it. A preset measured on one
+  logo is meaningless for a different logo.
+- Round the box **outward**. Too large costs a little speed; too small leaves a
+  sliver of watermark in the output.
+- Confirm the log says `loading LaMa on cuda` on a GPU box. If it says `cpu`, you
+  have the CPU-only torch wheel and are running 20-50x slower than you should be.
+
+---
+
+## Calibrating a new watermark — the long version
+
+Steps 1-4 happen **once per watermark design**, not once per video. Step 5 is the
+only one you run day to day, and `wmrm batch` in the section above is step 5.
+
+Read this the first time you meet a new logo, then never again. Keep one preset
+per mark — `fanza.json`, `ippa.json`.
 
 ```bash
-# find the coordinates: pull a frame, crop the corner, overlay a 50px grid
-ffmpeg -ss 30 -i your.mp4 -frames:v 1 \
-    -vf "crop=520:130:1400:15,scale=iw*3:ih*3:flags=neighbor,drawgrid=w=150:h=390:c=red" \
-    -y grid.png
+source .venv/bin/activate                                  # every session
 
-wmrm run your.mp4 --box 1554,44,284,62 --preview-only   # check, processes nothing
-wmrm detect your.mp4 --box 1554,44,284,62 --preset wm-preset.json   # freeze it
-wmrm run your.mp4 --preset wm-preset.json
+wmrm grid your.mp4 --corner tr                             # 1. read coordinates
+wmrm coverage your.mp4 --box X,Y,W,H                       # 2. check objectively
+wmrm run your.mp4 --box X,Y,W,H --preview-only             # 3. check by eye
+wmrm detect your.mp4 --box X,Y,W,H --preset fanza.json     # 4. freeze it
+wmrm run your.mp4 --preset fanza.json                      # 5. process
 ```
 
-`detect --box` skips detection entirely and just writes the preset, so
-hand-measured coordinates are reusable like any other.
+### 1. Read the coordinates — `wmrm grid`
 
-**More than one watermark?** If they sit next to each other, use one box covering
-both — that is the normal case for a studio logo beside a rating mark. Boxes far
-apart are not supported; run the tool twice.
+Writes `your-grid.png`: the corner, zoomed 3x, with red gridlines every 25 source
+pixels. It also prints the crop origin, which you **add** to what you read off the
+grid. Read the mark's left, top, right and bottom edges, then compute
+`X,Y,W,H = left, top, right-left, bottom-top`.
+
+Why by hand rather than `wmrm detect`: detection looks for pixel-locked *edges*.
+That works on a semi-transparent mark and fails completely on opaque white text
+over a white wall — measured, it found nothing at all on such a clip, and only one
+glyph of a five-letter logo on another. Measuring takes two minutes and never
+breaks. `wmrm detect` is still there as a first guess if you want one; treat its
+answer as a proposal to verify, never as the answer.
+
+### 2. Check it objectively — `wmrm coverage`
+
+Answers "is any of the mark still outside this box?" It looks in a ring around the
+box for two signals at once: pixel-locked edges (finds semi-transparent marks) and
+collapsed temporal variance (finds opaque ones, because an overlay freezes whatever
+is under it). That combination is what makes it work where detection does not.
+
+Three possible answers:
+
+- `covered` — nothing mark-like outside. Good.
+- `UNDER-COVERED — mark extends left +48px` plus a suggested box. Re-run with the
+  suggestion; it is capped by the ring size, so two or three rounds may be needed.
+- `INCONCLUSIVE` — almost the whole ring looks mark-like, which means the
+  background is itself static (fixed camera, plain wall) and no statistic can tell
+  mark from wall. Fall back to step 3 and your eyes.
+
+Not a proof: measured, from a box 160 px too small, iterating converged to 16 px
+too small. It shrinks the error a lot; it does not eliminate it. Erring a few
+pixels large is cheap, so round outward.
+
+### 3. Check by eye — `wmrm run --preview-only`
+
+Writes `your-boxcheck-zoom.png` with the box drawn on a real frame, and processes
+nothing. **This is the final authority.** Both automated checks above have measured
+failure modes; this one catches what they miss. Confirm every edge of the mark is
+inside the red box.
+
+### 4. Freeze it — `wmrm detect --box`
+
+`--box` makes `detect` skip detection entirely and just write the preset, so
+hand-measured coordinates become reusable like any other. Coordinates are stored
+normalized, so the preset survives a resolution change.
+
+### 5. Process — `wmrm run` / `wmrm batch`
+
+```bash
+wmrm run your.mp4 --preset fanza.json         # -> your-clean.mp4
+wmrm batch ./inbox --preset fanza.json        # whole folder, skips finished files
+```
+
+`run` verifies its own output afterwards (resolution, fps, duration, audio, and
+that the edit stayed local). On a GPU machine leave `--quality` alone; on CPU see
+[which quality to use](#which---quality-and-how-long-it-takes) — `fast` is often
+enough and ~20x quicker.
+
+### More than one watermark?
+
+If they sit next to each other — a studio logo beside a rating mark is the normal
+case — use one box covering both. Marks far apart are not supported in a single
+pass; run the tool twice, feeding the second run the first run's output.
 
 ---
 
@@ -262,6 +319,11 @@ python tests/score.py detail        # PSNR vs the clean original + comparison PN
 python tests/flicker.py detail      # temporal coherence
 python tests/check_gitignore.py     # assert the ignore rules still behave
 ```
+
+`src/wmrm/pick.py` is **not wired into the CLI**. It generates a self-contained
+HTML page for drawing the box with a mouse, and is parked for the UI phase — the
+tool runs in headless containers today, where opening a browser is not practical.
+It is the piece to start from when that UI is built.
 
 Fixtures burn a fake badge onto a clean clip, so recovery is scored against
 ground truth rather than guessed at. Cases: `smooth` and `busy` put the badge on

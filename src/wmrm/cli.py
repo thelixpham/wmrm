@@ -390,6 +390,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_args(b)
     b.set_defaults(func=cmd_batch, preview_only=False)
 
+    # `pick` (browser box-drawing) is intentionally not wired up: it belongs with
+    # the UI work, not the CLI. See pick.py.
+
     g = sub.add_parser("grid", help="dump a frame with a coordinate grid, to measure by hand")
     g.add_argument("input")
     g.add_argument("-o", "--output", help="default: NAME-grid.png")
