@@ -9,7 +9,8 @@ Three guards stop burned-in subtitles or description text from being mistaken
 for the logo (KNOWLEDGE.md 2.3.1):
 
 1. Geometric  -- only a corner ROI is searched, so bottom/centre text is
-   excluded by construction.
+   excluded by construction. Verified on real footage: a burned-in Japanese
+   disclaimer along the bottom edge was never even looked at.
 2. Persistence -- a candidate must be present in ~every sampled frame. The logo
    is; captions that appear for part of the clip are not.
 3. Human     -- a preview PNG is written and the tool stops. Nothing runs
@@ -34,6 +35,11 @@ class DetectError(RuntimeError):
     pass
 
 
+# Swept high to low when no threshold is given. A high threshold sees only the
+# boldest mark; lowering it picks up faint ones too, and eventually scenery.
+THRESHOLD_SWEEP = (10.0, 7.0, 5.0, 4.0, 3.0, 2.5, 2.0, 1.5)
+
+
 @dataclass
 class Detection:
     box: Box                  # in full-frame coordinates
@@ -41,8 +47,9 @@ class Detection:
     area_percent: float       # of the whole frame
     inside_std: float         # temporal std inside the box
     background_std: float     # temporal std of nearby background
-    opacity: str              # "opaque" | "semi"
+    opacity: str              # "opaque" | "semi" | "unclear"
     n_samples: int
+    threshold: float = 0.0    # gradient threshold actually used
     warnings: tuple[str, ...] = ()
 
     @property
@@ -51,15 +58,15 @@ class Detection:
 
     def describe(self) -> str:
         x, y, w, h = self.box.as_tuple()
-        return (
+        text = (
             f"box       : x={x} y={y} w={w} h={h}\n"
             f"area      : {self.area_percent:.2f}% of frame\n"
-            f"samples   : {self.n_samples} frames\n"
-            f"temporal  : std inside={self.inside_std:.2f}  background={self.background_std:.2f}"
-            f"  ratio={self.std_ratio:.3f}\n"
+            f"samples   : {self.n_samples} frames, gradient threshold {self.threshold:g}\n"
+            f"temporal  : std inside={self.inside_std:.2f}  "
+            f"background={self.background_std:.2f}  ratio={self.std_ratio:.3f}\n"
             f"opacity   : {self.opacity}"
-            + ("".join(f"\nWARNING   : {w}" for w in self.warnings) if self.warnings else "")
         )
+        return text + "".join(f"\nWARNING   : {w}" for w in self.warnings)
 
 
 def sample_frames(info: VideoInfo, n: int, roi: Box | None = None) -> np.ndarray:
@@ -74,8 +81,7 @@ def sample_frames(info: VideoInfo, n: int, roi: Box | None = None) -> np.ndarray
         raise DetectError(f"{info.source}: unknown duration, cannot sample")
 
     # Avoid the very start/end: fades and black frames carry no useful gradient.
-    lo, hi = info.duration * 0.04, info.duration * 0.96
-    stamps = np.linspace(lo, hi, num=max(2, n))
+    stamps = np.linspace(info.duration * 0.04, info.duration * 0.96, num=max(2, n))
 
     frames: list[np.ndarray] = []
     nbytes = info.width * info.height * 3
@@ -101,53 +107,29 @@ def sample_frames(info: VideoInfo, n: int, roi: Box | None = None) -> np.ndarray
     return np.stack(frames).astype(np.float32)
 
 
-def detect(
-    src: Path,
-    *,
-    corner: str = "tr",
-    samples: int = 40,
-    roi_frac: float = 0.30,
-    grad_threshold: float = 10.0,
-    persistence: float = 0.90,
-    max_area_percent: float = 10.0,
-    pad: int = 2,
-) -> Detection:
-    info = probe(src)
-    roi = corner_search_roi(info.width, info.height, corner, roi_frac)
-    stack = sample_frames(info, samples, roi)     # (N, h, w, 3) float32
-    n = stack.shape[0]
-
-    gray = stack.mean(axis=3)                      # (N, h, w)
-    dy = np.gradient(gray, axis=1)
-    dx = np.gradient(gray, axis=2)
-
+def _box_at(dy: np.ndarray, dx: np.ndarray, thr: float, persistence: float,
+            pad: int, shape: tuple[int, int]) -> Box | None:
+    """Candidate box in ROI-local coordinates for one threshold, or None."""
     # Signed-gradient cancellation: take the mean *before* abs. Scene edges flip
     # sign between unrelated frames and average toward zero; a pixel-locked
     # watermark keeps the same signed edge every frame and survives.
-    consistent = (np.abs(dy.mean(axis=0)) > grad_threshold) | \
-                 (np.abs(dx.mean(axis=0)) > grad_threshold)
-
+    consistent = (np.abs(dy.mean(axis=0)) > thr) | (np.abs(dx.mean(axis=0)) > thr)
     # Guard 2: the edge must also be present in nearly every frame.
-    hit = (np.abs(dy) > grad_threshold) | (np.abs(dx) > grad_threshold)
-    persist = hit.mean(axis=0)
+    persist = ((np.abs(dy) > thr) | (np.abs(dx) > thr)).mean(axis=0)
 
     score = (consistent & (persist >= persistence)).astype(np.float32)
     if score.max() <= 0:
-        raise DetectError(
-            f"no watermark found in the {corner} corner of {src.name}.\n"
-            f"Try --corner (tl/tr/bl/br), a larger --roi-frac, a lower "
-            f"--grad-threshold (now {grad_threshold}), or pass --box x,y,w,h by hand."
-        )
+        return None
 
     # Blur + re-threshold closes glyph outlines into solid strokes and reaches
     # slightly into the watermark's anti-aliased fringe.
     score = cv2.GaussianBlur(score, (0, 0), 3)
     score /= score.max()
 
-    # Hysteresis, as in Canny. A single threshold under-covers badly on textured
-    # backgrounds: only the parts of the badge that contrast strongly register,
-    # so the box comes out too small and leaves watermark residue behind. Seed
-    # from confident pixels, then grow through weaker ones connected to them.
+    # Hysteresis, as in Canny. A single cut-off under-covers on textured
+    # backgrounds: only the high-contrast parts of the mark register, so the box
+    # comes out too small and leaves residue. Seed from confident pixels, then
+    # grow through weaker ones connected to them.
     strong = score > 0.20
     weak = (score > 0.06).astype(np.uint8)
     n_weak, weak_labels = cv2.connectedComponents(weak, connectivity=8)
@@ -158,10 +140,8 @@ def detect(
     else:
         binary = strong.astype(np.uint8) * 255
 
-    # A logo is several separate strokes ("AI" + "gen" + a plate), so bridge
-    # nearby pieces into one blob before labelling. Without this, the largest
-    # single component is one glyph and the box under-covers the watermark --
-    # which leaves part of it in the output.
+    # A logo is several separate strokes, so bridge nearby pieces into one blob
+    # before labelling. Without this the largest single component is one glyph.
     gap = max(9, int(round(min(binary.shape) * 0.06)) | 1)
     binary = cv2.morphologyEx(
         binary, cv2.MORPH_CLOSE,
@@ -170,7 +150,7 @@ def detect(
 
     n_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if n_labels <= 1:
-        raise DetectError(f"no connected watermark region in the {corner} corner of {src.name}")
+        return None
 
     areas = stats[1:, cv2.CC_STAT_AREA]
     # Union every component that is a meaningful fraction of the biggest one.
@@ -180,27 +160,109 @@ def detect(
     y0 = int(stats[keep, cv2.CC_STAT_TOP].min())
     x1 = int((stats[keep, cv2.CC_STAT_LEFT] + stats[keep, cv2.CC_STAT_WIDTH]).max())
     y1 = int((stats[keep, cv2.CC_STAT_TOP] + stats[keep, cv2.CC_STAT_HEIGHT]).max())
-    bx, by, bw, bh = x0, y0, x1 - x0, y1 - y0
 
-    # temporal statistics, measured before padding
-    inside = stack[:, by: by + bh, bx: bx + bw, :]
-    inside_std = float(inside.std(axis=0).mean())
-    outside = np.ones(gray.shape[1:], bool)
-    outside[max(0, by - 8): by + bh + 8, max(0, bx - 8): bx + bw + 8] = False
-    background_std = float(stack[:, outside, :].std(axis=0).mean()) if outside.any() else 0.0
+    return Box(max(0, x0 - pad), max(0, y0 - pad),
+               (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad).clamp(shape[1], shape[0])
 
-    bx, by = max(0, bx - pad), max(0, by - pad)
-    bw, bh = bw + 2 * pad, bh + 2 * pad
-    box = Box(roi.x + bx, roi.y + by, bw, bh).clamp(info.width, info.height)
 
-    area_percent = 100.0 * box.area() / (info.width * info.height)
-    # Guard: an oversized box means the detector latched onto scenery, not a badge.
-    if area_percent > max_area_percent:
+def detect(
+    src: Path,
+    *,
+    corner: str = "tr",
+    samples: int = 40,
+    roi_frac: float = 0.30,
+    grad_threshold: float | None = None,   # None = sweep
+    persistence: float = 0.90,
+    max_area_percent: float = 10.0,
+    pad: int = 2,
+) -> Detection:
+    info = probe(src)
+    roi = corner_search_roi(info.width, info.height, corner, roi_frac)
+    stack = sample_frames(info, samples, roi)      # (N, h, w, 3) float32
+
+    gray = stack.mean(axis=3)                      # (N, h, w)
+    dy = np.gradient(gray, axis=1)
+    dx = np.gradient(gray, axis=2)
+    shape = gray.shape[1:]
+    frame_area = info.width * info.height
+    limit = max_area_percent / 100.0 * frame_area
+
+    def candidate(thr: float) -> Box | None:
+        return _box_at(dy, dx, thr, persistence, pad, shape)
+
+    chosen_thr: float | None = grad_threshold
+    if grad_threshold is not None:
+        local = candidate(grad_threshold)
+    else:
+        # Sweep the whole range, then pick the largest *stable* box still under the
+        # area limit. Sampling frames is the expensive part and is already done, so
+        # evaluating every threshold is nearly free.
+        #
+        # Why sweep: a threshold tuned for a bold mark silently misses a faint one
+        # beside it, and the box then covers only half the watermark. Measured on
+        # real footage: at 10 only the rating badge was found (116 px wide), at 2
+        # the faint studio logo beside it was included too (283 px).
+        #
+        # Why "largest stable" and not "first plateau": the area curve has several
+        # plateaus -- one per mark it has managed to pick up. Stopping at the first
+        # one finds only the boldest mark. A plateau means two adjacent thresholds
+        # agree to within 10%, which distinguishes a real mark from a one-off
+        # blow-up at the bottom of the range; among those, the largest covers every
+        # mark. Over-covering costs a little speed, under-covering leaves residue.
+        # A corner mark occupies a small part of the search window. Anything
+        # filling most of the ROI is the background itself, not a watermark --
+        # and that really happens: a smooth static gradient *is* a pixel-locked
+        # consistent edge, so at a low enough threshold the whole sky qualifies.
+        # Measured: without this guard a soft-sky clip returned a 112x192 box
+        # (7% of frame, the full ROI height) instead of the 84x36 badge.
+        roi_area = roi.area()
+
+        def plausible(box: Box) -> bool:
+            return (box.area() <= limit
+                    and box.area() <= 0.35 * roi_area
+                    and box.w <= 0.75 * roi.w
+                    and box.h <= 0.75 * roi.h)
+
+        found = [(thr, box) for thr in THRESHOLD_SWEEP
+                 if (box := candidate(thr)) is not None and plausible(box)]
+        best: tuple[float, Box] | None = None
+        for i, (thr, box) in enumerate(found):
+            stable = any(
+                abs(box.area() - other.area()) <= 0.10 * max(box.area(), other.area())
+                for j, (_, other) in enumerate(found) if abs(i - j) == 1
+            )
+            if stable and (best is None or box.area() > best[1].area()):
+                best = (thr, box)
+        if best is None and found:
+            best = found[0]               # nothing stable: take the most conservative
+        if best is not None:
+            chosen_thr, local = best[0], best[1]
+        else:
+            local = None
+
+    if local is None:
+        hint = (f"a lower --grad-threshold (swept {THRESHOLD_SWEEP[0]:g}"
+                f"..{THRESHOLD_SWEEP[-1]:g})" if grad_threshold is None
+                else f"a lower --grad-threshold (now {grad_threshold:g})")
         raise DetectError(
-            f"candidate covers {area_percent:.1f}% of the frame (limit "
-            f"{max_area_percent}%) -- that is scenery or a caption, not a corner badge.\n"
-            f"Tighten with --roi-frac / --grad-threshold, or pass --box by hand."
+            f"no watermark found in the {corner} corner of {src.name}.\n"
+            f"Try --corner (tl/tr/bl/br), a larger --roi-frac, {hint}, "
+            f"or pass --box x,y,w,h by hand."
         )
+
+    box = Box(roi.x + local.x, roi.y + local.y, local.w, local.h).clamp(
+        info.width, info.height)
+    area_percent = 100.0 * box.area() / frame_area
+
+    inside_std = float(
+        stack[:, local.y: local.y + local.h, local.x: local.x + local.w, :]
+        .std(axis=0).mean()
+    )
+    outside = np.ones(shape, bool)
+    outside[max(0, local.y - 8): local.y + local.h + 8,
+            max(0, local.x - 8): local.x + local.w + 8] = False
+    background_std = (float(stack[:, outside, :].std(axis=0).mean())
+                      if outside.any() else 0.0)
 
     ratio = inside_std / background_std if background_std > 1e-6 else 0.0
     # A truly opaque badge hides the background completely, so its pixels barely
@@ -208,26 +270,24 @@ def detect(
     # the alpha-unblend route becomes available (KNOWLEDGE.md 3.1).
     opacity = "opaque" if ratio < 0.15 else ("semi" if ratio > 0.40 else "unclear")
 
-    # Under-coverage is the dangerous failure: a box that is too small leaves
-    # watermark residue, and unlike over-coverage it is easy to miss in a preview.
-    # It happens on textured backgrounds, where only the high-contrast parts of
-    # the badge register. Flag the shapes that suggest it rather than pretend the
-    # detection is trustworthy everywhere.
+    # Under-coverage is the dangerous failure: too small a box leaves residue,
+    # and unlike over-coverage it is easy to miss in a preview.
     warnings: list[str] = []
     ratio_wh = box.w / box.h if box.h else 0.0
     if ratio_wh > 5 or ratio_wh < 0.2:
         warnings.append(
-            f"box is very elongated ({box.w}x{box.h}); a partly-detected badge "
+            f"box is very elongated ({box.w}x{box.h}); a partly-detected mark "
             "looks like this. Check the zoom preview closely."
         )
     # A background-busyness warning was tried here and dropped: measured
-    # background_std does not discriminate (it fired on a clip where detection
-    # was in fact good), and a warning that cries wolf gets ignored.
+    # background_std did not discriminate (it fired on a clip where detection was
+    # in fact good), and a warning that cries wolf gets ignored.
 
     return Detection(
         box=box, roi=roi, area_percent=area_percent,
         inside_std=inside_std, background_std=background_std,
-        opacity=opacity, n_samples=n, warnings=tuple(warnings),
+        opacity=opacity, n_samples=stack.shape[0],
+        threshold=float(chosen_thr or 0.0), warnings=tuple(warnings),
     )
 
 
@@ -255,8 +315,8 @@ def write_preview(src: Path, box: Box, out_png: Path, *, roi: Box | None = None,
     cv2.rectangle(frame, (box.x, box.y), (box.x + box.w, box.y + box.h),
                   (0, 0, 255), 1)
 
-    # Zoom is cropped from the annotated frame: the point of it is to check that
-    # the box actually covers the whole watermark, so it needs the box in it.
+    # Zoom is cropped from the annotated frame: its whole purpose is checking that
+    # the box covers the entire watermark, so it needs the box drawn in it.
     if zoom_png is not None:
         m = 40
         crop = frame[max(0, box.y - m): box.y + box.h + m,
@@ -267,6 +327,7 @@ def write_preview(src: Path, box: Box, out_png: Path, *, roi: Box | None = None,
                              interpolation=cv2.INTER_NEAREST)
             zoom_png.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(zoom_png), big)
+
     out_png.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(out_png), frame):
         raise DetectError(f"could not write preview to {out_png}")

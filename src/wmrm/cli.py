@@ -97,26 +97,40 @@ def _make_backend(args):
 
 def cmd_detect(args) -> int:
     src = Path(args.input)
-    det = detect(
-        src,
-        corner=args.corner,
-        samples=args.samples,
-        roi_frac=args.roi_frac,
-        grad_threshold=args.grad_threshold,
-        persistence=args.persistence,
-        max_area_percent=args.max_area,
-    )
-    print(det.describe())
+    if not src.exists():
+        raise SystemExit(f"error: {src} not found")
+    info = probe(src)
+
+    # `--box` turns this into "freeze these coordinates into a preset". Detection
+    # is unreliable on busy backgrounds, so hand-measured coordinates need a way
+    # to become a reusable preset too -- otherwise you are retyping them forever.
+    det = None
+    if args.box:
+        box = Box.parse(args.box).clamp(info.width, info.height)
+        roi = None
+        opacity = "unknown"
+        print(f"using the box you supplied: x={box.x} y={box.y} w={box.w} h={box.h}")
+    else:
+        det = detect(
+            src,
+            corner=args.corner,
+            samples=args.samples,
+            roi_frac=args.roi_frac,
+            grad_threshold=args.grad_threshold,
+            persistence=args.persistence,
+            max_area_percent=args.max_area,
+        )
+        print(det.describe())
+        box, roi, opacity = det.box, det.roi, det.opacity
 
     preview = Path(args.preview) if args.preview else src.with_name(f"{src.stem}-preview.png")
     zoom = preview.with_name(f"{preview.stem}-zoom{preview.suffix}")
-    write_preview(src, det.box, preview, roi=det.roi, zoom_png=zoom)
+    write_preview(src, box, preview, roi=roi, zoom_png=zoom)
 
     preset_path = Path(args.preset) if args.preset else src.with_name("wm-preset.json")
-    info = probe(src)
     preset = Preset.from_box(
-        det.box, info.width, info.height,
-        opacity=det.opacity,
+        box, info.width, info.height,
+        opacity=opacity,
         dilate_px=args.dilate if args.dilate is not None else 5,
         feather_px=args.feather if args.feather is not None else 12,
         margin_px=args.margin if args.margin is not None else 64,
@@ -124,9 +138,10 @@ def cmd_detect(args) -> int:
     preset.save(preset_path)
 
     print(f"\npreset written -> {preset_path}")
-    print(f"preview        -> {preview}  (red = watermark box, orange = search area)")
+    print(f"preview        -> {preview}"
+          + ("  (red = watermark box, orange = search area)" if roi else "  (red = your box)"))
     print(f"zoomed preview -> {zoom}")
-    if det.opacity == "semi":
+    if det and det.opacity == "semi":
         print(
             "\nNOTE: the watermark looks semi-transparent (background bleeds through).\n"
             "      Alpha un-blend could recover the original almost exactly; that path\n"
@@ -277,8 +292,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="frames sampled across the clip (default 40)")
     d.add_argument("--roi-frac", type=float, default=0.30,
                    help="corner search window as a fraction of the frame (default 0.30)")
-    d.add_argument("--grad-threshold", type=float, default=10.0,
-                   help="edge strength threshold (default 10); lower finds fainter logos")
+    d.add_argument("--grad-threshold", type=float, default=None,
+                   help="edge strength threshold. Default: swept automatically from "
+                        "10 down to 1.5, stopping where the box stops growing -- that "
+                        "finds faint marks a fixed threshold misses. Pass a number to "
+                        "override")
     d.add_argument("--persistence", type=float, default=0.90,
                    help="fraction of sampled frames a pixel must appear in (default 0.90). "
                         "This is what rejects subtitles and temporary text")
@@ -286,7 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="reject a candidate larger than this %% of the frame (default 10)")
     d.add_argument("--preview", help="where to write the preview PNG")
     _add_region_args(d)
-    d.set_defaults(func=cmd_detect, preset=None, box=None)
+    d.set_defaults(func=cmd_detect)
 
     r = sub.add_parser("run", help="process one video")
     r.add_argument("input")
