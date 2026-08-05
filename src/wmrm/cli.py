@@ -95,6 +95,15 @@ def _log_config(src: Path, dst: Path, info, box: Box, preset: Preset, args,
                           margin_px=preset.margin_px)
     if backend is not None:
         engine, where = backend.name, backend.device_note
+    elif args.quality == "video":
+        from .video import describe_device, find_repo
+
+        engine = "propainter (flow propagation across frames)"
+        try:
+            engine += f" @ {find_repo(args.propainter)}"
+        except Exception as exc:                     # reported, not fatal here
+            engine += f" -- NOT FOUND: {exc}"
+        where = describe_device()
     else:
         engine, where = "ffmpeg delogo+feather", "cpu (ffmpeg filters, no model)"
 
@@ -114,11 +123,14 @@ def _log_config(src: Path, dst: Path, info, box: Box, preset: Preset, args,
     # Only report patch reuse when the backend genuinely does it. un-blend does
     # not: its transform is already deterministic, so echoing the cache flags there
     # would describe behaviour that is not happening.
-    from .backends import CachingBackend
+    from .backends import CachingBackend, UnblendBackend
 
     if isinstance(backend, CachingBackend):
         p(f"[cfg] reuse    : patch-hold {backend.hold}, "
           f"tolerance {backend.tolerance}")
+    if isinstance(backend, UnblendBackend) and backend.fallback is None:
+        p("[cfg] note     : recovery only -- nothing is synthesized, so a faint "
+          "trace of the mark can remain")
     p(f"[cfg] encode   : libx264 crf {args.crf} preset {args.x264_preset}, "
       f"audio copy")
 
@@ -129,6 +141,19 @@ def _default_output(src: Path) -> Path:
 
 def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
     encode = EncodeOpts(crf=args.crf, x264_preset=args.x264_preset)
+    if args.quality == "video":
+        from .video import ProPainterOpts, find_repo, run_propainter
+
+        return run_propainter(
+            src, dst, box=box,
+            dilate_px=preset.dilate_px, feather_px=preset.feather_px,
+            margin_px=preset.margin_px, encode=encode,
+            progress=not args.quiet,
+            opts=ProPainterOpts(repo=find_repo(args.propainter),
+                                segment=args.pp_segment,
+                                raft_iter=args.raft_iter,
+                                fp16=not args.no_fp16),
+        )
     if args.quality == "fast":
         return run_fast(
             src, dst, box=box,
@@ -145,7 +170,10 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
 
 def _make_backend(args, *, src: Path | None = None, box: Box | None = None,
                   preset: Preset | None = None):
-    if args.quality == "fast":
+    # Both of these own their whole clip: `fast` is one ffmpeg graph, `video` is a
+    # sequence model that needs many frames at once. Neither fits the per-frame
+    # Backend interface, so there is nothing to build here.
+    if args.quality in ("fast", "video"):
         return None
     from .backends import make_backend
 
@@ -467,16 +495,34 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     # measured: temporal correlation 0.98 vs 0.30, 34 fps vs 1.4, and surrounding
     # detail left intact instead of repainted. LaMa stays available for genuinely
     # opaque marks, where there is nothing to recover.
-    p.add_argument("--quality", choices=("unblend", "high", "fast", "draft"),
+    p.add_argument("--quality", choices=("unblend", "video", "high", "fast", "draft"),
                    default="unblend",
                    help="unblend = solve the alpha blend and RECOVER the real "
-                        "background (default) -- best for semi-transparent marks, "
-                        "cannot flicker, needs no GPU; "
-                        "high = LaMa inpainting on a crop tile, for opaque marks; "
+                        "background (default) -- keeps every pixel, but leaves a "
+                        "faint trace; "
+                        "video = ProPainter, fills from neighbouring frames -- the "
+                        "only one that removes the mark COMPLETELY without "
+                        "inventing per frame. Needs a GPU and a ProPainter "
+                        "checkout; "
+                        "high = LaMa inpainting on a crop tile, per frame; "
                         "fast = ffmpeg delogo+feather, smears on texture; "
                         "draft = cv2.inpaint, lowest quality")
+    p.add_argument("--propainter", default=None,
+                   help="path to the ProPainter checkout (else $PROPAINTER_HOME, "
+                        "else a sibling directory of this project)")
+    p.add_argument("--pp-segment", type=int, default=400,
+                   help="frames per ProPainter invocation (default 400). It loads a "
+                        "whole segment into memory, so lower this if you run out")
+    p.add_argument("--raft-iter", type=int, default=20,
+                   help="ProPainter optical-flow iterations (default 20). Lower is "
+                        "faster and less accurate")
+    p.add_argument("--no-fp16", action="store_true",
+                   help="disable half precision in ProPainter (ignored on CPU)")
     p.add_argument("--unblend-samples", type=int, default=40,
                    help="frames used to fit the un-blend map (default 40)")
+    # No --stroke-alpha flag. Repairing only the glyph strokes was implemented and
+    # measured, and it does not work -- see UnblendBackend for the numbers. Exposing
+    # a knob that cannot deliver just adds a decision nobody can make correctly.
     p.add_argument("--crf", type=int, default=18, help="x264 CRF (default 18)")
     p.add_argument("--x264-preset", default="medium", help="x264 preset (default medium)")
     p.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto",

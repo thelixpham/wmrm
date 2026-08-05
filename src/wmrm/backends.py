@@ -139,34 +139,78 @@ class LamaBackend(Backend):
 
 
 class UnblendBackend(Backend):
-    """Solve the alpha blend for the real background instead of inpainting.
+    """Solve the alpha blend for the real background, then optionally erase what is
+    left on the glyph strokes alone.
 
     Only valid for semi-transparent marks, and only after `unblend.fit` has been
     given frames from the specific clip -- the fitted map is per-video, not a
     property of the logo alone (compression and grading change it).
 
-    Pixels the mark blocks almost completely cannot be divided back out; those are
-    delegated to `fallback` if one is supplied.
+    Two stages, and the second one is what makes complete removal possible:
+
+    1. `fit.apply` divides the blend back out. This recovers real background and
+       cannot flicker, but it can never reach zero residual: the leftover is
+       proportional to the error in alpha, and alpha has to be estimated from
+       background statistics that are by definition unobservable under the mark.
+    2. Where alpha says there is a real stroke, hand *those pixels only* to an
+       inpainter. Removal there is guaranteed because the pixels are replaced, not
+       corrected.
+
+    MEASURED RESULT: stage 2 with a stroke-shaped mask **does not work**, and is off
+    by default (`stroke_alpha=0`). Residual locked-edge energy on two reference
+    frames, un-blend alone scoring 32.4:
+
+        stroke mask, alpha > 0.10  (40% of box)   29.7
+        stroke mask, alpha > 0.15  (28% of box)   31.9
+        stroke mask, alpha > 0.20  (14% of box)   32.6
+        full-box mask                            20.5   <- and visually clean
+
+    The trace survives every stroke threshold. Widening the mask until it goes is the
+    same thing as masking the whole box, which is just `--quality high`. So there is
+    no middle setting that removes the mark while keeping most original pixels: the
+    parameter is kept because the negative result is worth recording, not because
+    there is a value of it worth using.
+
+    Stage 2 is fed the *stage 1 output* rather than the original frame, which also
+    turned out not to matter: with a full-box mask the inpainter discards everything
+    inside it anyway, and B/C of that experiment scored identically.
     """
 
     name = "unblend"
 
-    def __init__(self, fitted, fallback: Backend | None = None) -> None:
+    def __init__(self, fitted, fallback: Backend | None = None, *,
+                 stroke_alpha: float = 0.0, stroke_dilate: int = 2,
+                 feather_px: int = 3) -> None:
         self.fit = fitted
         self.fallback = fallback
+
+        hard = fitted.opaque.copy()
+        if stroke_alpha > 0:
+            hard |= fitted.stroke_mask(stroke_alpha, dilate_px=stroke_dilate)
+        self.hard = hard
+        self.hard_fraction = float(hard.sum() / max(fitted.mark_mask.sum(), 1))
+        self._hard_u8 = (hard * 255).astype(np.uint8)
+
+        # Feathered copy used only for compositing, so the repaired strokes do not
+        # meet the recovered background along a hard 1px edge.
+        k = max(1, feather_px) | 1
+        self._alpha = (cv2.GaussianBlur(self._hard_u8, (k, k), 0)
+                       .astype(np.float32) / 255.0)[:, :, None]
+
         self.device_note = "cpu (numpy only, no model)"
-        if fitted.opaque_fraction > 0 and fallback is not None:
+        if fallback is not None and hard.any():
             self.name = f"unblend+{fallback.name}"
-            self.device_note = (f"cpu (numpy); opaque-pixel fallback on "
+            self.device_note = (f"cpu (numpy); stroke repair on "
                                 f"{fallback.device_note}")
 
     def inpaint(self, tile_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         out = self.fit.apply(tile_bgr)
-        opaque = self.fit.opaque
-        if opaque.any() and self.fallback is not None:
-            patched = self.fallback.inpaint(tile_bgr, (opaque * 255).astype(np.uint8))
-            out = np.where(opaque[:, :, None], patched, out)
-        return out
+        if self.fallback is None or not self.hard.any():
+            return out
+        patched = self.fallback.inpaint(out, self._hard_u8)
+        blended = patched.astype(np.float32) * self._alpha + \
+            out.astype(np.float32) * (1.0 - self._alpha)
+        return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 class CachingBackend(Backend):
@@ -234,16 +278,24 @@ class CachingBackend(Backend):
 
 def make_backend(quality: str, *, threads: int | None = None,
                  cache_tolerance: float = 1.0, patch_hold: int = 1,
-                 device: str = "auto", fitted=None) -> Backend:
+                 device: str = "auto", fitted=None,
+                 stroke_alpha: float = 0.0, stroke_dilate: int = 2) -> Backend:
     if quality == "unblend":
         if fitted is None:
             raise ValueError("quality='unblend' needs a fitted map from unblend.fit")
-        fallback = None
-        if fitted.opaque_fraction > 0:
+        needs_repair = fitted.opaque_fraction > 0 or stroke_alpha > 0
+        fallback: Backend | None = None
+        if needs_repair:
             fallback = LamaBackend(device=device, threads=threads)
-        # No caching: the transform is already deterministic and per-frame cheap,
-        # so reusing patches would only cost accuracy for no speed worth having.
-        return UnblendBackend(fitted, fallback=fallback)
+            # Only the repair stage is wrapped, and only when asked: the un-blend
+            # transform itself is deterministic, but per-frame inpainting of the
+            # strokes is not, so --patch-hold is the lever against boiling there.
+            if patch_hold > 1:
+                fallback = CachingBackend(fallback, tolerance=cache_tolerance,
+                                          hold=patch_hold)
+        return UnblendBackend(fitted, fallback=fallback,
+                              stroke_alpha=stroke_alpha,
+                              stroke_dilate=stroke_dilate)
     if quality == "high":
         inner: Backend = LamaBackend(device=device, threads=threads)
     elif quality == "draft":

@@ -29,10 +29,13 @@ Tune it with environment variables, no flags to remember:
 
 ```bash
 CORNER=tl ./run.sh                  # watermark is top-left
-QUALITY=high ./run.sh               # mark is fully opaque (see below)
+QUALITY=video ./run.sh              # mark must be COMPLETELY gone (needs a GPU)
 FORCE=1 ./run.sh                    # redo files already in outbox
 OUTBOX=/data/out ./run.sh clip.mp4
 ```
+
+`FORCE=1` matters more than it looks: without it, files already in `outbox/` are
+skipped, so after changing anything you will be looking at the **old** output.
 
 <details>
 <summary>Prefer the CLI directly?</summary>
@@ -62,24 +65,36 @@ wmrm batch ./inbox --preset fanza.json                          # reuse forever
 
 </details>
 
-**Do not pass `--quality`.** The default (`unblend`) is the best option for the
-watermarks this tool exists for, and it needs no GPU. Only change it if the
-watermark is *opaque* — if you cannot see any of the picture through it. Then use
-`QUALITY=high`, which loads LaMa and wants a GPU.
+### Which engine — this is the only real decision
 
-Why the default is not the AI model, measured on real footage:
+**Must the mark be *completely* gone?** Then `QUALITY=video ./run.sh`. It is the only
+option that gets there. Needs a GPU and a [ProPainter](#complete-removal--quality-video)
+checkout.
 
-| | `unblend` (default) | `high` (LaMa) |
-|---|---|---|
-| what it does | solves the alpha blend, **recovers** the real background | deletes the region and **generates** a replacement |
-| temporal stability (corr. with true motion) | **0.98** | 0.30 |
-| speed, 1080p | **34 fps** | 1.4 fps CPU / ~30 fps CUDA |
-| detail around the mark | untouched | repainted, often visibly |
-| GPU | not used | 20–50× faster with one |
+**Is "almost gone, nothing damaged" enough?** Leave the default. No GPU, 34 fps,
+never touches a pixel it was not asked to.
 
-A translucent mark suppresses the background but does not remove it, so the
-picture is still in the signal and can be divided back out. Inpainting throws that
-away and guesses — which is why it looked worse on the clips the customer reviewed.
+Measured on the reference clip, tile 400×168, background locked-edge floor **12.24**
+(residual at or below that means no watermark is findable any more):
+
+| | residual | corr | detail in the box | GPU |
+|---|---|---|---|---|
+| untouched | 25.60 | 1.00 | — | — |
+| `unblend` (default) | 13.02 | **0.99** | **untouched** | no |
+| `high` (LaMa) | 12.42 | 0.68 | **wrecked when leaves cross the box** | wants one |
+| **`video` (ProPainter)** | **11.36** | 0.82 | preserved | **needs one** |
+
+`corr` is whether the patch changes where the real content changed; low means it
+moves on its own, which is what reads as boiling.
+
+Why the difference. A translucent mark suppresses the background but does not delete
+it, so `unblend` divides the blend back out — recovery, not invention, which is why it
+cannot flicker. But its leftover is proportional to the error in alpha, and alpha
+must be estimated from statistics that are unobservable under the mark, so it can
+never reach zero. `high` reaches zero by deleting the region, then invents a
+replacement from the same frame, per frame. `video` reaches zero by taking the pixels
+from **neighbouring frames**, where the same content is not covered — real content,
+which is also why it stays coherent.
 
 **Everything else in this file is for when something looks wrong.** Skip it until
 it does.
@@ -346,6 +361,53 @@ recover — use `high`), at least ~12 frames, and background that actually chang
 behind the mark. Pixels the mark blocks almost totally are handed to LaMa
 automatically.
 
+### Complete removal — `--quality video`
+
+The only engine that removes the mark outright without inventing content per frame.
+It is [ProPainter](https://github.com/sczhou/ProPainter): optical flow between frames,
+so the hole is filled with the same content seen uncovered a few frames earlier or
+later. On this footage the leaves move, so that content genuinely exists.
+
+One-time setup — it is a research repo, not a package, so there is nothing to pip
+install:
+
+```bash
+git clone https://github.com/sczhou/ProPainter.git
+export PROPAINTER_HOME=$PWD/ProPainter          # or clone it beside this project
+uv pip install av addict einops future scipy scikit-image imageio-ffmpeg \
+               pyyaml requests timm matplotlib
+uv pip install --index-url https://download.pytorch.org/whl/cu124 torchvision
+```
+
+The `torchvision` line is not optional and must come from the **same index as your
+torch**. A PyPI torchvision next to a `+cu124` torch fails with
+`operator torchvision::nms does not exist`, which does not mention either package.
+
+Weights (~190 MB total) download themselves on first run.
+
+```bash
+QUALITY=video ./run.sh                    # or:
+wmrm run clip.mp4 --preset fanza.json --quality video
+```
+
+Speed: **9m14s for 151 frames of 1080p on 6 CPU cores** — do not run it on CPU for
+real work. Expect 20–50× that on CUDA. The log's `[cfg] device` line tells you which
+you got, using ProPainter's own selection rule.
+
+Knobs, in the order worth touching: `--pp-segment` (frames per invocation, default
+400 — lower it if you run out of memory, since it loads a whole segment at once),
+`--raft-iter` (flow iterations, default 20; lower is faster and rougher), `--no-fp16`.
+
+Two things this wrapper does that matter:
+
+- **It reads ProPainter's PNG frames, never its mp4.** Its writer pads to a multiple
+  of 16 — `resizing from (400, 168) to (400, 176)` — so the mp4 no longer lines up
+  with the crop it came from. There is an assertion on the tile size for this.
+- **It segments the clip with discarded overlap.** `--subvideo_length` only chunks
+  inference; the script still loads every frame it is handed into memory first, so an
+  unsegmented hour of video does not fit. Overlap frames give the model context on
+  both sides of every frame that is kept, so the joins do not show.
+
 ### Which `--quality`, and how long it takes
 
 Measured on CPU (6 cores). The 1080p column is a real clip with a 284x62 mark:
@@ -354,14 +416,18 @@ Measured on CPU (6 cores). The 1080p column is a real clip with a 284x62 mark:
 | --- | --- | --- | --- |
 | `unblend` (default) | fast | **34 fps** | **~30 s** |
 | `high` (LaMa) | 5.5–7 fps | 1.4 fps | **~22 min** |
+| `video` (ProPainter) | — | **0.27 fps** | **~1.8 h** ← CPU is not an option |
 | `fast` (delogo) | ~realtime | ~realtime | ~1 min |
 | `draft` (cv2) | ~95 fps | fast | seconds |
 
-The default is both the best-looking and the fastest option here, so there is no
-speed/quality decision to make on a semi-transparent mark — which is why the older
-advice in this file to "try `fast` first on CPU" is gone. `fast` and `draft` remain
-only as fallbacks for when un-blend cannot apply: too few frames, or a background
-that never changes behind the mark.
+The default is the fastest **and** the least destructive, so on a semi-transparent
+mark there is no speed/quality trade to make — which is why the older advice in this
+file to "try `fast` first on CPU" is gone. `fast` and `draft` remain only as
+fallbacks for when un-blend cannot apply: too few frames, or a background that never
+changes behind the mark.
+
+The real trade is elsewhere: `video` is the only engine that removes the mark
+completely, and the price is a GPU. On CPU it is ~400× slower than the default.
 
 **Opaque marks are the exception.** There un-blend has nothing to recover and
 `high` is the right answer — 1.4 fps on CPU, 20–50× that on CUDA. `--patch-hold N`

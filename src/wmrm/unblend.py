@@ -103,6 +103,26 @@ class Unblend:
             f"locked-edge energy in the mark"
         )
 
+    def stroke_mask(self, threshold: float, *, dilate_px: int = 2) -> np.ndarray:
+        """Pixels where the mark is strong enough that a residual would show.
+
+        This is the point of fitting alpha at all beyond the division: it tells us
+        *which* pixels are glyph, so a second stage can be pointed at those alone
+        instead of at the whole box. Measured on the reference clip, the strokes are
+        15% of the box area -- so 85% of the region keeps its original pixels
+        untouched instead of being repainted from scratch.
+
+        Dilated slightly because anti-aliased stroke edges sit just below any
+        threshold you pick, and leaving a one-pixel outline behind would defeat the
+        purpose.
+        """
+        m = (self.alpha > threshold) & self.mark_mask
+        if dilate_px > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (2 * dilate_px + 1, 2 * dilate_px + 1))
+            m = cv2.dilate(m.astype(np.uint8), k).astype(bool) & self.mark_mask
+        return m
+
     def apply(self, tile_bgr: np.ndarray) -> np.ndarray:
         """B = (C - k) / m, clamped."""
         c = tile_bgr.astype(np.float32)
