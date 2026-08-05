@@ -29,13 +29,30 @@ CLEAN_SUFFIX = "-clean"
 # helpers
 # --------------------------------------------------------------------------- #
 
-def _resolve_region(args, width: int, height: int) -> tuple[Box, Preset]:
-    """Return the box to use plus the knobs, from --box or --preset."""
+def _resolve_region(args, width: int, height: int, *, src: Path | None = None
+                    ) -> tuple[Box, Preset]:
+    """Return the box to use plus the knobs, from --box, --preset or --detect."""
     if args.box and args.preset:
         raise SystemExit("error: pass either --box or --preset, not both")
     if args.box:
         box = Box.parse(args.box).clamp(width, height)
         preset = Preset.from_box(box, width, height)
+    elif not args.preset and getattr(args, "detect", False):
+        if src is None:
+            raise SystemExit("error: --detect needs an input file")
+        # Detection is a guess with measured failure modes, so a preview is
+        # always written and every processed file still goes through the usual
+        # verification. If detection finds nothing it raises, which aborts the
+        # run rather than quietly processing with a bogus box.
+        det = detect(src, corner=args.corner)
+        print(det.describe())
+        preview = src.with_name(f"{src.stem}-preview.png")
+        write_preview(src, det.box, preview, roi=det.roi,
+                      zoom_png=preview.with_name(f"{preview.stem}-zoom.png"))
+        print(f"\nCHECK {preview.with_name(preview.stem + '-zoom.png')} afterwards. "
+              "Detection is a guess, not a guarantee.\n")
+        box = det.box
+        preset = Preset.from_box(box, width, height, opacity=det.opacity)
     elif args.preset:
         path = Path(args.preset)
         if not path.exists():
@@ -47,8 +64,10 @@ def _resolve_region(args, width: int, height: int) -> tuple[Box, Preset]:
         box = preset.box_for(width, height)
     else:
         raise SystemExit(
-            "error: need --preset wm.json or --box x,y,w,h\n"
-            "  run 'wmrm detect YOUR.mp4' first to create a preset"
+            "error: need one of --preset wm.json, --box x,y,w,h, or --detect\n"
+            "  --detect          find the watermark and process in one go\n"
+            "  --box x,y,w,h     coordinates you measured (see 'wmrm grid')\n"
+            "  --preset wm.json  saved coordinates (see 'wmrm detect')"
         )
 
     overrides = {
@@ -59,6 +78,49 @@ def _resolve_region(args, width: int, height: int) -> tuple[Box, Preset]:
     if overrides:
         preset = replace(preset, **overrides)
     return box, preset
+
+
+def _log_config(src: Path, dst: Path, info, box: Box, preset: Preset, args,
+                backend) -> None:
+    """Print the effective configuration once, before any frames are touched.
+
+    Mostly so a wrong device is impossible to miss: the CPU-only torch wheel on a
+    GPU machine runs 20-50x slower and produces byte-identical output, so nothing
+    downstream reveals the mistake.
+    """
+    from .region import build_region
+
+    region = build_region(box, info.width, info.height,
+                          dilate_px=preset.dilate_px, feather_px=preset.feather_px,
+                          margin_px=preset.margin_px)
+    if backend is not None:
+        engine, where = backend.name, backend.device_note
+    else:
+        engine, where = "ffmpeg delogo+feather", "cpu (ffmpeg filters, no model)"
+
+    p = lambda s: print(s, file=sys.stderr)      # noqa: E731
+    p(f"[cfg] input    : {src.name} -> {dst.name}")
+    p(f"[cfg] video    : {info.width}x{info.height} @ {info.fps} fps, "
+      f"{info.nframes or '?'} frames, {info.duration:.2f}s, "
+      f"audio {'yes' if info.has_audio else 'none'}")
+    p(f"[cfg] box      : {box.x},{box.y},{box.w},{box.h}   "
+      f"dilate {preset.dilate_px}  feather {preset.feather_px}  "
+      f"margin {preset.margin_px}")
+    p(f"[cfg] tile     : {region.tile.w}x{region.tile.h} "
+      f"({100 * region.tile.area() / (info.width * info.height):.2f}% of frame) "
+      f"-- cost scales with this")
+    p(f"[cfg] engine   : {engine}  (--quality {args.quality})")
+    p(f"[cfg] device   : {where}")
+    if args.quality not in ("fast",):
+        extra = []
+        if getattr(args, "patch_hold", 1) > 1:
+            extra.append(f"patch-hold {args.patch_hold}")
+        if getattr(args, "cache_tolerance", 0):
+            extra.append(f"cache-tolerance {args.cache_tolerance}")
+        if extra:
+            p(f"[cfg] reuse    : {', '.join(extra)}")
+    p(f"[cfg] encode   : libx264 crf {args.crf} preset {args.x264_preset}, "
+      f"audio copy")
 
 
 def _default_output(src: Path) -> Path:
@@ -81,14 +143,53 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
     )
 
 
-def _make_backend(args):
+def _make_backend(args, *, src: Path | None = None, box: Box | None = None,
+                  preset: Preset | None = None):
     if args.quality == "fast":
         return None
     from .backends import make_backend
-    quality = "draft" if args.quality == "draft" else "high"
-    return make_backend(quality, threads=args.threads,
+
+    fitted = None
+    if args.quality == "unblend":
+        if src is None or box is None or preset is None:
+            raise SystemExit("error: --quality unblend needs an input file and a box")
+        fitted = _fit_unblend(src, box, preset, samples=args.unblend_samples)
+
+    return make_backend(args.quality, threads=args.threads,
                         cache_tolerance=args.cache_tolerance,
-                        patch_hold=args.patch_hold, device=args.device)
+                        patch_hold=args.patch_hold, device=args.device,
+                        fitted=fitted)
+
+
+def _fit_unblend(src: Path, box: Box, preset: Preset, *, samples: int = 40):
+    """Sample the clip and solve for the mark's alpha map.
+
+    Fitted per video, not per logo: compression and colour grading change the
+    numbers even for the same watermark.
+    """
+    import numpy as np
+
+    from .detect import sample_frames
+    from .region import build_region
+    from .unblend import fit
+
+    info = probe(src)
+    region = build_region(box, info.width, info.height,
+                          dilate_px=preset.dilate_px, feather_px=preset.feather_px,
+                          margin_px=preset.margin_px)
+    frames = sample_frames(info, samples, region.tile)
+
+    mark = np.zeros(frames.shape[1:3], bool)
+    mark[box.y - region.tile.y: box.y - region.tile.y + box.h,
+         box.x - region.tile.x: box.x - region.tile.x + box.w] = True
+
+    fitted = fit(frames, mark)
+    print(f"[wmrm] un-blend fitted from {frames.shape[0]} frames", file=sys.stderr)
+    print(fitted.describe(), file=sys.stderr)
+    if fitted.alpha_median > 0.85:
+        print("\nWARNING: this mark is nearly opaque -- un-blend has little to "
+              "recover here.\n         Use --quality high instead.", file=sys.stderr)
+    return fitted
 
 
 # --------------------------------------------------------------------------- #
@@ -162,7 +263,7 @@ def cmd_run(args) -> int:
     if not src.exists():
         raise SystemExit(f"error: {src} not found")
     info = probe(src)
-    box, preset = _resolve_region(args, info.width, info.height)
+    box, preset = _resolve_region(args, info.width, info.height, src=src)
     dst = Path(args.output) if args.output else _default_output(src)
 
     if args.preview_only:
@@ -171,7 +272,7 @@ def cmd_run(args) -> int:
         print(f"box {box.as_tuple()} drawn on {out}; nothing processed")
         return 0
 
-    backend = _make_backend(args)
+    backend = _make_backend(args, src=src, box=box, preset=preset)
     _process_one(src, dst, box, preset, args, backend)
 
     if not args.no_verify:
@@ -206,13 +307,41 @@ def cmd_batch(args) -> int:
         return 0
 
     print(f"[wmrm] {len(todo)} video(s) to process", file=sys.stderr)
-    backend = _make_backend(args)
+
+    # With --detect, detect ONCE on the first video and reuse it for the whole
+    # folder. Detecting per file is what makes unattended batch dangerous: every
+    # file gets a different box, so one bad guess corrupts one file and you have
+    # no single thing to eyeball. One box, one preview, one decision.
+    shared: Preset | None = None
+    if getattr(args, "detect", False) and not args.box and not args.preset:
+        first = todo[0][0]
+        print(f"[wmrm] detecting on {first.name}, then applying to all "
+              f"{len(todo)} files", file=sys.stderr)
+        info = probe(first)
+        _, shared = _resolve_region(args, info.width, info.height, src=first)
+
+    first_src, _ = todo[0]
+    first_info = probe(first_src)
+    if shared is not None:
+        first_box = shared.box_for(first_info.width, first_info.height)
+        first_preset = shared
+    else:
+        first_box, first_preset = _resolve_region(
+            args, first_info.width, first_info.height, src=first_src)
+    # One fitted map for the folder, same reasoning as one box for the folder.
+    backend = _make_backend(args, src=first_src, box=first_box, preset=first_preset)
     failures = []
     for i, (src, dst) in enumerate(todo, 1):
         print(f"\n[wmrm] ({i}/{len(todo)}) {src.name}", file=sys.stderr)
         try:
             info = probe(src)
-            box, preset = _resolve_region(args, info.width, info.height)
+            if shared is not None:
+                # Normalized coordinates, so a folder of mixed resolutions still
+                # gets the right box for each file.
+                preset = shared.scaled_px(info.width, info.height)
+                box = preset.box_for(info.width, info.height)
+            else:
+                box, preset = _resolve_region(args, info.width, info.height, src=src)
             _process_one(src, dst, box, preset, args, backend)
         except (EncodeError, ProbeError, DetectError) as exc:
             print(f"[wmrm] FAILED {src.name}: {exc}", file=sys.stderr)
@@ -319,10 +448,23 @@ def _add_region_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_run_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--quality", choices=("high", "fast", "draft"), default="high",
-                   help="high = LaMa on a crop tile (default, best); "
-                        "fast = ffmpeg delogo+feather, near-realtime, smears on texture; "
-                        "draft = cv2.inpaint, seconds, lowest quality")
+    p.add_argument("--detect", action="store_true",
+                   help="find the watermark and process in one go, no preset needed. "
+                        "For 'batch' it detects once on the first file and applies "
+                        "that box to all of them. A preview PNG is written either "
+                        "way -- check it, detection is a guess")
+    p.add_argument("--corner", choices=CORNERS, default="tr",
+                   help="corner to search with --detect (default tr)")
+    p.add_argument("--quality", choices=("high", "unblend", "fast", "draft"),
+                   default="high",
+                   help="high = LaMa on a crop tile (default); "
+                        "unblend = solve the alpha blend and RECOVER the real "
+                        "background -- best for semi-transparent marks, and it "
+                        "cannot flicker; "
+                        "fast = ffmpeg delogo+feather, smears on texture; "
+                        "draft = cv2.inpaint, lowest quality")
+    p.add_argument("--unblend-samples", type=int, default=40,
+                   help="frames used to fit the un-blend map (default 40)")
     p.add_argument("--crf", type=int, default=18, help="x264 CRF (default 18)")
     p.add_argument("--x264-preset", default="medium", help="x264 preset (default medium)")
     p.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto",

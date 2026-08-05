@@ -46,8 +46,36 @@ def resolve_device(requested: str = "auto") -> str:
     return requested
 
 
+def describe_device(device: str) -> str:
+    """Human-readable note about where work will actually run.
+
+    Worth printing on every run: installing the CPU-only torch wheel on a GPU
+    machine is silent and costs 20-50x, and there is no way to notice it from the
+    output video.
+    """
+    try:
+        import torch
+    except ImportError:  # pragma: no cover
+        return f"{device} (torch not installed)"
+
+    if device == "cuda":
+        try:
+            i = torch.cuda.current_device()
+            name = torch.cuda.get_device_name(i)
+            vram = torch.cuda.get_device_properties(i).total_memory / 1024 ** 3
+            return f"cuda ({name}, {vram:.1f} GB, torch {torch.__version__})"
+        except Exception:  # pragma: no cover
+            return f"cuda (torch {torch.__version__})"
+    if device == "cpu":
+        why = "no CUDA device" if not torch.cuda.is_available() else "CUDA available but not selected"
+        return (f"cpu ({torch.get_num_threads()} threads, {why}, "
+                f"torch {torch.__version__})")
+    return f"{device} (torch {torch.__version__})"
+
+
 class Backend(ABC):
     name: str
+    device_note: str = "cpu"
 
     @abstractmethod
     def inpaint(self, tile_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -59,6 +87,7 @@ class Cv2Backend(Backend):
     texture -- keep it for previews and for the `fast` quality tier."""
 
     name = "cv2"
+    device_note = "cpu (OpenCV, no model)"
 
     def __init__(self, radius: int = 3, method: str = "telea") -> None:
         if method not in ("telea", "ns"):
@@ -93,6 +122,7 @@ class LamaBackend(Backend):
         self._lama = SimpleLama(device=torch.device(device))
         self._Image = __import__("PIL.Image", fromlist=["Image"])
         self.device = device
+        self.device_note = describe_device(device)
 
     def inpaint(self, tile_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         Image = self._Image
@@ -106,6 +136,37 @@ class LamaBackend(Backend):
             arr = cv2.resize(arr, (tile_bgr.shape[1], tile_bgr.shape[0]),
                              interpolation=cv2.INTER_LANCZOS4)
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+class UnblendBackend(Backend):
+    """Solve the alpha blend for the real background instead of inpainting.
+
+    Only valid for semi-transparent marks, and only after `unblend.fit` has been
+    given frames from the specific clip -- the fitted map is per-video, not a
+    property of the logo alone (compression and grading change it).
+
+    Pixels the mark blocks almost completely cannot be divided back out; those are
+    delegated to `fallback` if one is supplied.
+    """
+
+    name = "unblend"
+
+    def __init__(self, fitted, fallback: Backend | None = None) -> None:
+        self.fit = fitted
+        self.fallback = fallback
+        self.device_note = "cpu (numpy only, no model)"
+        if fitted.opaque_fraction > 0 and fallback is not None:
+            self.name = f"unblend+{fallback.name}"
+            self.device_note = (f"cpu (numpy); opaque-pixel fallback on "
+                                f"{fallback.device_note}")
+
+    def inpaint(self, tile_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        out = self.fit.apply(tile_bgr)
+        opaque = self.fit.opaque
+        if opaque.any() and self.fallback is not None:
+            patched = self.fallback.inpaint(tile_bgr, (opaque * 255).astype(np.uint8))
+            out = np.where(opaque[:, :, None], patched, out)
+        return out
 
 
 class CachingBackend(Backend):
@@ -136,6 +197,7 @@ class CachingBackend(Backend):
         if hold > 1:
             bits.append(f"hold{hold}")
         self.name = "+".join(bits)
+        self.device_note = inner.device_note
         self.tolerance = tolerance
         self.hold = max(1, hold)
         self._prev_ctx: np.ndarray | None = None
@@ -172,13 +234,22 @@ class CachingBackend(Backend):
 
 def make_backend(quality: str, *, threads: int | None = None,
                  cache_tolerance: float = 1.0, patch_hold: int = 1,
-                 device: str = "auto") -> Backend:
+                 device: str = "auto", fitted=None) -> Backend:
+    if quality == "unblend":
+        if fitted is None:
+            raise ValueError("quality='unblend' needs a fitted map from unblend.fit")
+        fallback = None
+        if fitted.opaque_fraction > 0:
+            fallback = LamaBackend(device=device, threads=threads)
+        # No caching: the transform is already deterministic and per-frame cheap,
+        # so reusing patches would only cost accuracy for no speed worth having.
+        return UnblendBackend(fitted, fallback=fallback)
     if quality == "high":
         inner: Backend = LamaBackend(device=device, threads=threads)
     elif quality == "draft":
         inner = Cv2Backend()
     else:
-        raise ValueError(f"unknown quality {quality!r} (want 'high' or 'draft')")
+        raise ValueError(f"unknown quality {quality!r}")
     if cache_tolerance > 0 or patch_hold > 1:
         return CachingBackend(inner, tolerance=cache_tolerance, hold=patch_hold)
     return inner

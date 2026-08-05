@@ -10,25 +10,62 @@ Findings, measurements and the quality trade-offs live in
 
 ## If you only read one section
 
-**Every day — one command.** Drop videos in a folder, point at the preset for
-that watermark:
+**Just run the script.** It finds the watermark, processes everything, and puts
+the results in `outbox/`.
 
 ```bash
-wmrm batch ./inbox --preset fanza.json
+./run.sh                        # every video in inbox/
+./run.sh clip.mp4               # one file
+./run.sh a.mp4 b.mp4 c.mov      # several files
+./run.sh /data/videos           # another folder
+./run.sh /data/videos x.mp4     # folders and files mixed
 ```
 
-That already uses the best backend (LaMa). On a GPU box, never pass `--quality` —
-there is nothing to trade away. `--quality fast` exists only for CPU-bound
-machines, where LaMa costs about 22 minutes per minute of 1080p video.
+The first run detects the watermark and **saves the box to `preset.json`**. Every
+run after that reuses it, so results are repeatable instead of re-guessed. Delete
+`preset.json` to recalibrate.
 
-**A watermark you have never handled before — three commands, once.** After this
-you are back to the one-liner above, forever.
+Tune it with environment variables, no flags to remember:
 
 ```bash
-wmrm grid new.mp4 --corner tr                          # read X,Y,W,H off the grid
-wmrm run new.mp4 --box X,Y,W,H --preview-only          # confirm the box by eye
-wmrm detect new.mp4 --box X,Y,W,H --preset newmark.json    # save it
+CORNER=tl ./run.sh                  # watermark is top-left
+QUALITY=fast ./run.sh               # CPU-bound machine
+EXTRA="--device cuda" ./run.sh      # fail loudly if CUDA is unusable
+FORCE=1 ./run.sh                    # redo files already in outbox
+OUTBOX=/data/out ./run.sh clip.mp4
 ```
+
+<details>
+<summary>Prefer the CLI directly?</summary>
+
+```bash
+wmrm batch ./inbox --detect            # detect once, apply to the folder
+wmrm run clip.mp4 --detect             # one file
+```
+
+It detects **once** on the first file, applies that box to the whole folder, and
+writes a preview PNG next to it. **Look at that preview afterwards** — detection is
+a guess with real failure modes (see below), and this is the only thing standing
+between a bad guess and a folder of bad output.
+
+**Once you know the coordinates, pass them instead** — no detection, no surprises:
+
+```bash
+wmrm batch ./inbox --box 1640,20,205,62
+```
+
+For a watermark you handle regularly, save the coordinates once and reuse them:
+
+```bash
+wmrm detect one.mp4 --box 1640,20,205,62 --preset fanza.json   # save
+wmrm batch ./inbox --preset fanza.json                          # reuse forever
+```
+
+</details>
+
+Everything uses the best backend (LaMa) by default. On a GPU box never pass
+`--quality` — there is nothing to trade away. `--quality fast` exists only for
+CPU-bound machines, where LaMa costs about 22 minutes per minute of 1080p video.
 
 **Everything else in this file is for when something looks wrong.** Skip it until
 it does.
@@ -219,7 +256,7 @@ Install notes, all deliberate:
 
 | flag | default | what it does |
 | --- | --- | --- |
-| `--quality` | `high` | `high` = LaMa (best), `fast` = ffmpeg delogo (near-realtime, smears on texture), `draft` = cv2.inpaint (coordinate checks only) |
+| `--quality` | `high` | `unblend` = **best for semi-transparent marks**, `high` = LaMa, `fast` = ffmpeg delogo, `draft` = cv2.inpaint. See below. |
 | `--grad-threshold` | swept | `detect` only. Swept 10→1.5 automatically; pass a number to pin it. |
 | `--device` | `auto` | `auto` takes CUDA when present. Use `cuda` to fail loudly instead of silently falling back to CPU. |
 | `--dilate` | 5 | grow the mask. **Raise this first if any watermark fringe survives.** |
@@ -231,6 +268,39 @@ Install notes, all deliberate:
 | `--no-verify` | | skip the acceptance checks |
 
 `wmrm run --help` lists everything.
+
+### Is the mark see-through? Then use `--quality unblend`
+
+Run `wmrm detect` and look at the `opacity` line. If it says `semi`, the background
+is still visible through the mark and can be **recovered** rather than invented:
+
+```bash
+wmrm run clip.mp4 --box X,Y,W,H --quality unblend
+```
+
+A translucent mark is an alpha blend, `C = a*W + (1-a)*B`. Fit `a` and `W` once
+from ~40 sampled frames and every frame is solved back to the real `B`. Inpainting
+throws that away and guesses instead — which is fine over a blurred background and
+obvious over detailed one.
+
+Measured on a 1080p clip where the mark sat over maple leaves, and where the
+customer rejected the LaMa output:
+
+| | LaMa | un-blend |
+| --- | --- | --- |
+| leaf detail under the mark | destroyed, replaced by a pink smear | preserved |
+| frame-to-frame motion, correlation with real content | **0.30** (invented — this is the flicker) | **0.98** |
+| speed at 1080p | 1.4 fps | **34 fps** |
+
+The mark measured `alpha median 0.000` there: it was blocking essentially nothing,
+so inpainting was discarding an intact background. Un-blend also **cannot flicker** —
+the fitted map is constant, so there is no per-frame guessing to vary.
+
+Limits: it needs a **semi-transparent** mark (opaque white text has nothing to
+recover — use `high`), at least ~12 frames, and background that actually changes
+behind the mark. Pixels the mark blocks almost totally are handed to LaMa
+automatically. A faint ghost of the mark can survive; that is deliberate, see the
+rejected-alternative note in `src/wmrm/unblend.py` for why over-correcting is worse.
 
 ### Which `--quality`, and how long it takes
 
