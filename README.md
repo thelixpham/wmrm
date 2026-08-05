@@ -29,8 +29,7 @@ Tune it with environment variables, no flags to remember:
 
 ```bash
 CORNER=tl ./run.sh                  # watermark is top-left
-QUALITY=fast ./run.sh               # CPU-bound machine
-EXTRA="--device cuda" ./run.sh      # fail loudly if CUDA is unusable
+QUALITY=high ./run.sh               # mark is fully opaque (see below)
 FORCE=1 ./run.sh                    # redo files already in outbox
 OUTBOX=/data/out ./run.sh clip.mp4
 ```
@@ -63,21 +62,40 @@ wmrm batch ./inbox --preset fanza.json                          # reuse forever
 
 </details>
 
-Everything uses the best backend (LaMa) by default. On a GPU box never pass
-`--quality` — there is nothing to trade away. `--quality fast` exists only for
-CPU-bound machines, where LaMa costs about 22 minutes per minute of 1080p video.
+**Do not pass `--quality`.** The default (`unblend`) is the best option for the
+watermarks this tool exists for, and it needs no GPU. Only change it if the
+watermark is *opaque* — if you cannot see any of the picture through it. Then use
+`QUALITY=high`, which loads LaMa and wants a GPU.
+
+Why the default is not the AI model, measured on real footage:
+
+| | `unblend` (default) | `high` (LaMa) |
+|---|---|---|
+| what it does | solves the alpha blend, **recovers** the real background | deletes the region and **generates** a replacement |
+| temporal stability (corr. with true motion) | **0.98** | 0.30 |
+| speed, 1080p | **34 fps** | 1.4 fps CPU / ~30 fps CUDA |
+| detail around the mark | untouched | repainted, often visibly |
+| GPU | not used | 20–50× faster with one |
+
+A translucent mark suppresses the background but does not remove it, so the
+picture is still in the signal and can be divided back out. Inpainting throws that
+away and guesses — which is why it looked worse on the clips the customer reviewed.
 
 **Everything else in this file is for when something looks wrong.** Skip it until
 it does.
 
-Two rules that cover most mistakes:
+Rules that cover most mistakes:
 
 - One preset per watermark **design**, named after it. A preset measured on one
   logo is meaningless for a different logo.
 - Round the box **outward**. Too large costs a little speed; too small leaves a
   sliver of watermark in the output.
-- Confirm the log says `loading LaMa on cuda` on a GPU box. If it says `cpu`, you
-  have the CPU-only torch wheel and are running 20-50x slower than you should be.
+- Read the `[cfg]` banner each run — it prints the box, the tile size, the engine
+  and the device before any frame is touched.
+- Only if you use `QUALITY=high`: confirm the banner says `cuda (<gpu name>, ...)`.
+  If it says `cpu`, you have the CPU-only torch wheel and are running 20–50×
+  slower for byte-identical output. `EXTRA="--device cuda" QUALITY=high ./run.sh`
+  makes that a hard failure instead of a silent one.
 
 ---
 
@@ -154,9 +172,8 @@ wmrm batch ./inbox --preset fanza.json        # whole folder, skips finished fil
 ```
 
 `run` verifies its own output afterwards (resolution, fps, duration, audio, and
-that the edit stayed local). On a GPU machine leave `--quality` alone; on CPU see
-[which quality to use](#which---quality-and-how-long-it-takes) — `fast` is often
-enough and ~20x quicker.
+that the edit stayed local). Leave `--quality` alone unless the mark is opaque —
+the default runs at 34 fps on CPU, so there is nothing to trade away.
 
 ### More than one watermark?
 
@@ -220,13 +237,14 @@ Optional end-to-end smoke test, using a generated clip with a known watermark:
 
 ```bash
 python tests/make_fixtures.py
-wmrm run tests/fixtures/detail-marked.mp4 -o /tmp/smoke.mp4 \
-    --box 379,427,91,43 --patch-hold 8
+wmrm run tests/fixtures/detail-marked.mp4 -o /tmp/smoke.mp4 --box 379,427,91,43
 ```
 
-Must end with `=> all checks passed`, and the log must say `loading LaMa on cuda`
-on a GPU box (`cpu` otherwise). `--patch-hold 8` is only here to keep the check
-quick — leave it off for real work.
+Must end with `=> all checks passed`. It exercises the default engine, which loads
+no model — so to prove the GPU half of the install works, run it once more with
+`--quality high --patch-hold 8` and check the banner says
+`device : cuda (<gpu name>, ...)`. `--patch-hold 8` is only there to keep that
+check quick; leave it off for real work.
 
 Install notes, all deliberate:
 
@@ -256,7 +274,7 @@ Install notes, all deliberate:
 
 | flag | default | what it does |
 | --- | --- | --- |
-| `--quality` | `high` | `unblend` = **best for semi-transparent marks**, `high` = LaMa, `fast` = ffmpeg delogo, `draft` = cv2.inpaint. See below. |
+| `--quality` | `unblend` | `unblend` = recover the background (**leave it here**), `high` = LaMa, for opaque marks, `fast` = ffmpeg delogo, `draft` = cv2.inpaint. See below. |
 | `--grad-threshold` | swept | `detect` only. Swept 10→1.5 automatically; pass a number to pin it. |
 | `--device` | `auto` | `auto` takes CUDA when present. Use `cuda` to fail loudly instead of silently falling back to CPU. |
 | `--dilate` | 5 | grow the mask. **Raise this first if any watermark fringe survives.** |
@@ -269,14 +287,11 @@ Install notes, all deliberate:
 
 `wmrm run --help` lists everything.
 
-### Is the mark see-through? Then use `--quality unblend`
+### Why `unblend` is the default
 
-Run `wmrm detect` and look at the `opacity` line. If it says `semi`, the background
-is still visible through the mark and can be **recovered** rather than invented:
-
-```bash
-wmrm run clip.mp4 --box X,Y,W,H --quality unblend
-```
+Run `wmrm detect` and look at the `opacity` line. If it says `semi` — the normal
+case — the background is still visible through the mark and can be **recovered**
+rather than invented. That is what the default does; nothing to pass.
 
 A translucent mark is an alpha blend, `C = a*W + (1-a)*B`. Fit `a` and `W` once
 from ~40 sampled frames and every frame is solved back to the real `B`. Inpainting
@@ -308,21 +323,20 @@ Measured on CPU (6 cores). The 1080p column is a real clip with a 284x62 mark:
 
 | | 480x640 | 1080p | 1 minute of 1080p |
 | --- | --- | --- | --- |
+| `unblend` (default) | fast | **34 fps** | **~30 s** |
 | `high` (LaMa) | 5.5–7 fps | 1.4 fps | **~22 min** |
 | `fast` (delogo) | ~realtime | ~realtime | ~1 min |
 | `draft` (cv2) | ~95 fps | fast | seconds |
 
-**On GPU:** use `high` and stop thinking about it — 20-50x faster than the CPU
-numbers above.
+The default is both the best-looking and the fastest option here, so there is no
+speed/quality decision to make on a semi-transparent mark — which is why the older
+advice in this file to "try `fast` first on CPU" is gone. `fast` and `draft` remain
+only as fallbacks for when un-blend cannot apply: too few frames, or a background
+that never changes behind the mark.
 
-**On CPU: try `fast` first.** If the watermark sits on a plain wall, sky or
-gradient it is indistinguishable from `high` and finishes in seconds rather than
-tens of minutes. Measured on a real 1080p clip with the mark on a plain wall,
-`fast` and `high` both removed it completely with no visible difference. Switch
-to `high` only when the background under the mark has real detail — that is where
-`fast` smears.
-
-`--patch-hold N` cuts `high` runtime roughly N-fold. Read the caveat below first.
+**Opaque marks are the exception.** There un-blend has nothing to recover and
+`high` is the right answer — 1.4 fps on CPU, 20–50× that on CUDA. `--patch-hold N`
+cuts its runtime roughly N-fold; read the caveat below first.
 
 ### Detect options
 
@@ -338,13 +352,18 @@ watermark.
 
 Full measurements in [../REPORT.md](../REPORT.md) §4.
 
-**Temporal coherence is not solved.** Every frame is inpainted independently, so
-the patch either boils (LaMa) or sits frozen while the background moves
-(`fast`/`draft`). Measured: LaMa's frame-to-frame variation has the right
-amplitude but only **0.01 correlation** with where the real content changed — the
-variation is invented. `--patch-hold N` converts boiling into freezing rather
-than fixing it; treat it as a speed lever. A real fix needs ProPainter or E2FGVI
-on a GPU (REPORT.md §5, phase 2).
+**Temporal coherence is unsolved for the *inpainting* engines.** They fill each
+frame independently, so the patch either boils (`high`) or sits frozen while the
+background moves (`fast`/`draft`). Measured: LaMa's frame-to-frame variation has
+the right amplitude but only **0.01 correlation** with where the real content
+changed — the variation is invented. `--patch-hold N` converts boiling into
+freezing rather than fixing it; treat it as a speed lever. A real fix needs
+ProPainter or E2FGVI on a GPU (REPORT.md §5, phase 2).
+
+This is why `unblend` is the default and why an opaque mark is the harder case: the
+default's transform is fitted once and constant, so it has no per-frame guess to
+vary and **cannot** flicker (measured 0.98 correlation with true motion). The
+paragraph above applies only when you leave the default.
 
 **Auto-detect breaks when the watermark changes.** It searches for pixel-locked
 *edges*, which is the right signal for some marks and useless for others. Measured
@@ -376,8 +395,13 @@ separate mark from wall.
 a visibly better reconstruction. Judge with your eyes.
 
 **Not handled:** watermarks that move or animate; watermarks over ~10% of frame;
-semi-transparent watermarks are inpainted rather than un-blended (`detect`
-reports `opacity: semi` when it sees the background bleeding through).
+two marks far apart in one pass; opaque marks over moving detail (that is the
+`high` path, and it flickers — see above).
+
+**The default leaves a faint ghost.** Deliberate. The more accurate estimator was
+built, measured, and rejected because it over-corrects into bright colour blowouts
+over saturated backgrounds; see the rejected-alternative note in
+`src/wmrm/unblend.py`. Raise `--dilate` if the ghost bothers you at the edges.
 
 ---
 

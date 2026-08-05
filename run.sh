@@ -27,7 +27,8 @@ INBOX="${INBOX:-$HERE/inbox}"     # used only when no arguments are given
 OUTBOX="${OUTBOX:-$HERE/outbox}"
 PRESET="${PRESET:-$HERE/preset.json}"
 CORNER="${CORNER:-tr}"            # tr tl br bl -- where the watermark sits
-QUALITY="${QUALITY:-}"            # empty = best (LaMa). "fast" for CPU-bound boxes
+QUALITY="${QUALITY:-}"            # empty = the CLI default (un-blend). Override with
+                                  # "high" for an opaque mark, "fast" if ffmpeg-only
 EXTRA="${EXTRA:-}"                # anything else, e.g. EXTRA="--device cuda"
 FORCE="${FORCE:-}"                # set to 1 to redo files already in outbox
 
