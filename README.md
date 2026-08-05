@@ -10,8 +10,25 @@ Findings, measurements and the quality trade-offs live in
 
 ## If you only read one section
 
-**Just run the script.** It finds the watermark, processes everything, and puts
-the results in `outbox/`.
+**Not installed yet? → [Install](#install).** Everything below assumes `wmrm` is on
+your PATH. If `./run.sh` says `wmrm not found`, that is what you are missing.
+
+**Already installed: just run the script.** Start to finish:
+
+```bash
+cd wmrm
+source .venv/bin/activate       # every new shell
+
+mkdir -p inbox
+cp /wherever/*.mp4 inbox/       # originals are never modified
+
+./run.sh                        # -> outbox/<name>-clean.mp4
+```
+
+Then **watch one output before trusting the batch.** Removal quality is the one thing
+no automated check can confirm, and a still frame will not show flicker.
+
+Other ways to say what to process — same script, results always land in `outbox/`:
 
 ```bash
 ./run.sh                        # every video in inbox/
@@ -239,6 +256,32 @@ uv pip install --no-deps -e .
 source .venv/bin/activate
 ```
 
+**Step 3 — only for `--quality video`** (ProPainter, the one that removes the mark
+completely). Skip it and the other four engines still work.
+
+It is a research repo, not a package — nothing to `pip install`, so it has to exist
+as a checkout somewhere and be found by path:
+
+```bash
+git clone https://github.com/sczhou/ProPainter.git ../ProPainter
+
+uv pip install av addict einops future scipy scikit-image imageio-ffmpeg \
+               pyyaml requests timm matplotlib
+
+# MUST come from the same index as your torch above (cpu / cu124 / cu121)
+uv pip install --index-url https://download.pytorch.org/whl/cu124 torchvision
+```
+
+Cloning it beside this project is enough — it is found by path relative to the
+package, so the working directory does not matter. Anywhere else needs
+`export PROPAINTER_HOME=/path/to/ProPainter`.
+
+That `torchvision` line is the one that wastes an afternoon. A PyPI torchvision next
+to a `+cu124` torch fails with `operator torchvision::nms does not exist`, which names
+neither package and looks like a broken install.
+
+Its weights (~190 MB across three files) download themselves on first run.
+
 Then confirm, **in the shell you will actually use**:
 
 ```bash
@@ -363,6 +406,20 @@ automatically.
 
 ### Complete removal — `--quality video`
 
+> **Licence, read before using this on paid work.** ProPainter is published under the
+> **S-Lab License 1.0**: *"redistribution and use for non-commercial purpose ... are
+> permitted"*, and clause 4 requires contacting the authors for commercial use. An
+> internal tool processing a client's footage is commercial use even though the tool
+> itself is not sold. Permission contacts are in the repo's `LICENSE`; the engine
+> prints this warning on every run until `WMRM_PROPAINTER_OK=1` is set.
+>
+> Every other engine here is unencumbered: `unblend`, `fast` and `draft` are this
+> project's own code over numpy/OpenCV (BSD/Apache-2.0), and LaMa behind
+> `--quality high` is Apache-2.0 for both code and weights. If the licence is a
+> problem, §[Limits](#limits-worth-knowing-before-you-rely-on-it) explains what you
+> give up by staying on `unblend`.
+
+
 The only engine that removes the mark outright without inventing content per frame.
 It is [ProPainter](https://github.com/sczhou/ProPainter): optical flow between frames,
 so the hole is filled with the same content seen uncovered a few frames earlier or
@@ -394,9 +451,40 @@ Speed: **9m14s for 151 frames of 1080p on 6 CPU cores** — do not run it on CPU
 real work. Expect 20–50× that on CUDA. The log's `[cfg] device` line tells you which
 you got, using ProPainter's own selection rule.
 
-Knobs, in the order worth touching: `--pp-segment` (frames per invocation, default
-400 — lower it if you run out of memory, since it loads a whole segment at once),
-`--raft-iter` (flow iterations, default 20; lower is faster and rougher), `--no-fp16`.
+#### Making it fast enough for long video
+
+The tile is 412×172. That is small for a modern GPU, so **one segment probably does
+not fill it** — which makes `--pp-workers` the first knob to reach for, not the last.
+
+```bash
+# start here on a big GPU, then push workers up while fps keeps improving
+QUALITY=video EXTRA="--pp-workers 3 --pp-segment 1500 --raft-iter 12" ./run.sh
+```
+
+| knob | default | what it trades |
+| --- | --- | --- |
+| `--pp-workers` | 1 | segments run at once. 2–4 often scales nearly linearly on a large GPU. Back off on out-of-memory |
+| `--pp-segment` | 400 | frames per invocation. Higher = fewer process startups (measured 2.65 s each on CPU, more on CUDA) but more memory held at once |
+| `--raft-iter` | 20 | optical-flow iterations. Lower is faster and rougher; 12 held quality on the reference clip |
+| `--no-fp16` | off | disables half precision. Slower, only for debugging |
+
+Read the `[pp] TIME` line to know whether any of this matters:
+
+```
+[pp] TIME  extract 0.3s (0%)  model 2m16s (99%)  composite 1.3s (1%)
+```
+
+On CPU the model is everything, so only the knobs above move the needle. If a GPU
+pulls the model share down to roughly half, the bottleneck has moved to ffmpeg and
+these knobs stop helping.
+
+`[pp] EXTRAPOLATED` scales the run to an hour of the same footage, in both time and
+scratch disk. That is the number to trust when planning a multi-hour source — a
+one-minute test on its own tells you nothing.
+
+Disk is bounded by design: only one segment of PNGs exists at a time, and the
+repaired tile accumulates as a single lossless FFV1 file (~3.7 GB per hour on the
+reference clip) rather than one PNG per frame (~39 GB per hour).
 
 Two things this wrapper does that matter:
 
@@ -452,8 +540,11 @@ frame independently, so the patch either boils (`high`) or sits frozen while the
 background moves (`fast`/`draft`). Measured: LaMa's frame-to-frame variation has
 the right amplitude but only **0.01 correlation** with where the real content
 changed — the variation is invented. `--patch-hold N` converts boiling into
-freezing rather than fixing it; treat it as a speed lever. A real fix needs
-ProPainter or E2FGVI on a GPU (REPORT.md §5, phase 2).
+freezing rather than fixing it; treat it as a speed lever.
+
+**The fix exists: `--quality video`.** It is not on this list because it does not fill
+frames independently — it propagates content across them, which is why it scores 0.82
+correlation where LaMa scores 0.68 on the same clip while also removing more.
 
 This is why `unblend` is the default and why an opaque mark is the harder case: the
 default's transform is fitted once and constant, so it has no per-frame guess to

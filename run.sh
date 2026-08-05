@@ -35,6 +35,12 @@ FORCE="${FORCE:-}"                # set to 1 to redo files already in outbox
 # ----------------------------------------------------------------------------- #
 
 log()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+fmt_dur() {   # seconds -> 12s / 4m03s / 2h07m
+  local s=$1
+  if   (( s < 60 ));   then printf '%ds' "$s"
+  elif (( s < 3600 )); then printf '%dm%02ds' $((s / 60)) $((s % 60))
+  else printf '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60)); fi
+}
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
@@ -139,15 +145,22 @@ for src in "${videos[@]}"; do
   fi
 
   log "$base"
+  # Wall clock per file. SECONDS is a bash builtin that counts up, so this needs no
+  # date arithmetic and survives a run that spans midnight.
+  file_start=$SECONDS
   if "${WMRM[@]}" run "$src" -o "$out" --preset "$PRESET" "${args[@]}"; then
     processed=$((processed + 1))
+    printf '\033[32m%s took %s\033[0m\n' "$base" "$(fmt_dur $((SECONDS - file_start)))"
   else
-    warn "FAILED: $base"
+    warn "FAILED: $base  (after $(fmt_dur $((SECONDS - file_start))))"
     failed=$((failed + 1)); failed_names+=("$base")
   fi
 done
 
-log "done: $processed processed, $skipped skipped, $failed failed"
+log "done: $processed processed, $skipped skipped, $failed failed in $(fmt_dur $SECONDS)"
+if (( processed > 1 )); then
+  echo "average $(fmt_dur $((SECONDS / processed))) per processed file"
+fi
 echo "Results: $OUTBOX"
 (( failed )) && warn "failed: ${failed_names[*]}"
 
@@ -157,7 +170,19 @@ if [[ -f "$preview" ]]; then
   echo "Confirm the red box covered the whole watermark:"
   echo "  $preview"
   echo
-  echo "If it was wrong: rm $PRESET, then measure and save the real box:"
+  # Only offer the recalibrate recipe when the box is actually a plausible cause.
+  # It used to print unconditionally, so a failure with nothing to do with the box
+  # -- a duration mismatch, say -- still told you to go re-measure coordinates,
+  # which sends you re-doing calibration that was already correct.
+  if (( failed )); then
+    echo "Something failed above. Read the FAIL line before changing anything:"
+    echo "  'rest of frame preserved' / 'watermark region changed' -> box or mask"
+    echo "  resolution / frame rate / duration / audio -> encoding, not the box"
+    echo
+    echo "Only if the box is wrong: rm $PRESET, then measure and save the real one:"
+  else
+    echo "If the box is wrong: rm $PRESET, then measure and save the real one:"
+  fi
   echo "  $WMRM_SHOW grid ${videos[0]} --corner $CORNER"
   echo "  $WMRM_SHOW detect ${videos[0]} --box X,Y,W,H --preset $PRESET"
   echo "and run this again."
