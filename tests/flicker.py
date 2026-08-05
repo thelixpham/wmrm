@@ -95,12 +95,16 @@ def main(case: str) -> int:
     truth = consecutive(truth_p, START, COUNT)
     base = temporal_delta(truth, badge)
 
+    # Missing files are skipped rather than fatal: not every variant is rendered for
+    # every case, and a partial table is more useful than a crash.
     candidates = {
         "marked (untouched)": FIX / f"{case}-marked.mp4",
         "fast  (delogo+feather)": FIX / f"{case}-fast.mp4",
         "draft (cv2.inpaint)": FIX / f"{case}-draft.mp4",
         "high  (LaMa)": FIX / f"{case}-lama.mp4",
+        "unblend (default)": FIX / f"{case}-unblend.mp4",
     }
+    candidates = {k: v for k, v in candidates.items() if v.exists()}
 
     print(f"case: {case}   {COUNT} consecutive frames from t={START}s")
     print(f"ground-truth frame-to-frame change in badge region: {base:.2f} levels\n")

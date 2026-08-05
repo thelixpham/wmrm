@@ -198,6 +198,7 @@ python -c "import torch; print(torch.__version__, 'cuda:', torch.cuda.is_availab
 
 ```bash
 cd wmrm
+sudo apt update && sudo apt install ffmpeg -y
 uv venv .venv --python 3.12
 export VIRTUAL_ENV=$PWD/.venv
 ```
@@ -307,15 +308,43 @@ customer rejected the LaMa output:
 | frame-to-frame motion, correlation with real content | **0.30** (invented — this is the flicker) | **0.98** |
 | speed at 1080p | 1.4 fps | **34 fps** |
 
-The mark measured `alpha median 0.000` there: it was blocking essentially nothing,
-so inpainting was discarding an intact background. Un-blend also **cannot flicker** —
-the fitted map is constant, so there is no per-frame guessing to vary.
+Un-blend also **cannot flicker** — the fitted map is constant, so there is no
+per-frame guessing to vary. On the opaque test fixture it scores 0.87 correlation
+with the real motion against LaMa's 0.01.
+
+### Reading the fit report
+
+`run` prints the fit before it touches a frame. What the lines mean:
+
+```
+alpha in mark : median 0.040  p90 0.186  p99 0.298  max 0.387
+              : 1.0% of the mark has alpha > 0.3
+alpha scale   : x1.0 (chosen by residual sweep)
+mark residual : 8.76 -> 8.76 locked-edge energy in the mark
+```
+
+**`mark residual` is the line that matters.** It is how much pixel-locked structure
+is left inside the box, measured the same way the detector finds watermarks. Compare
+it to the surrounding background — on this clip the background floor was `10.05`, so
+`8.76` means the region is now *quieter* than its surroundings.
+
+Do not read `alpha median` as "how strong the mark is". The median is over the whole
+mark box, which is mostly gaps between glyphs, so it reads near zero for any text
+mark. Use `p99` and `max`, and read the residual for whether removal worked.
+
+Two guards run automatically and are worth knowing about:
+
+- **Alpha is capped by physics.** `B >= 0` forces `alpha <= min(C)/W` per pixel, so
+  on dark backgrounds alpha is clamped rather than driving the recovery negative.
+  Without it, the mark crossing a saturated red pillar left a dark blotch.
+- **Alpha is not smoothed.** Strokes are 2–3 px wide, so filtering at that scale
+  softens the matte and the division stops cancelling the stroke. Measured: residual
+  8.58 unsmoothed vs 14.06 with the old 3 px default, where the logo stayed readable.
 
 Limits: it needs a **semi-transparent** mark (opaque white text has nothing to
 recover — use `high`), at least ~12 frames, and background that actually changes
 behind the mark. Pixels the mark blocks almost totally are handed to LaMa
-automatically. A faint ghost of the mark can survive; that is deliberate, see the
-rejected-alternative note in `src/wmrm/unblend.py` for why over-correcting is worse.
+automatically.
 
 ### Which `--quality`, and how long it takes
 
@@ -398,10 +427,11 @@ a visibly better reconstruction. Judge with your eyes.
 two marks far apart in one pass; opaque marks over moving detail (that is the
 `high` path, and it flickers — see above).
 
-**The default leaves a faint ghost.** Deliberate. The more accurate estimator was
-built, measured, and rejected because it over-corrects into bright colour blowouts
-over saturated backgrounds; see the rejected-alternative note in
-`src/wmrm/unblend.py`. Raise `--dilate` if the ghost bothers you at the edges.
+**The default can leave a faint trace.** Not zero: on the reference clip the mark
+went from plainly legible to barely detectable, not to nothing. Check the
+`mark residual` line against the background around the box, and look at the output
+before shipping a batch — the metric saturates before the eye does, so once residual
+drops below the surrounding floor it can no longer tell you whether a trace remains.
 
 ---
 

@@ -41,13 +41,34 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not on PATH (apt install ffmpeg)"
 
 # Prefer the project venv so the script works from a bare shell too.
+#
+# Third branch matters more than it looks: the venv is often created somewhere
+# other than $HERE/.venv (activated from the parent directory, for instance), and
+# some install paths leave the package importable without putting the console
+# script on PATH. The module entry point is equivalent, so use it instead of
+# failing on a technicality.
 if [[ -x "$HERE/.venv/bin/wmrm" ]]; then
-  WMRM="$HERE/.venv/bin/wmrm"
+  WMRM=("$HERE/.venv/bin/wmrm")
 elif command -v wmrm >/dev/null 2>&1; then
-  WMRM="$(command -v wmrm)"
+  WMRM=("$(command -v wmrm)")
+elif python -c "import wmrm" >/dev/null 2>&1; then
+  WMRM=(python -m wmrm.cli)
 else
-  die "wmrm not found. Install it: see README.md"
+  # Say what was tried, not just that it failed -- "not found" alone sends people
+  # to reinstall something that is already installed in the wrong place.
+  die "wmrm not found. Looked for:
+    1. $HERE/.venv/bin/wmrm            $([[ -e "$HERE/.venv" ]] && echo "(.venv exists, but no wmrm in it)" || echo "(no .venv here)")
+    2. 'wmrm' on PATH                  (VIRTUAL_ENV=${VIRTUAL_ENV:-unset})
+    3. 'import wmrm' in $(command -v python || echo python)
+
+  The package itself is probably not installed -- an active venv only gives you
+  the dependencies. From $HERE run:
+
+    pip install -e .        # or: uv pip install -e .
+
+  Then check it with:  wmrm --help"
 fi
+WMRM_SHOW="${WMRM[*]}"
 
 is_video() {
   case "${1,,}" in
@@ -102,7 +123,7 @@ if [[ -f "$PRESET" ]]; then
   log "using saved box from $(basename "$PRESET")"
 else
   log "no preset yet -- detecting on $(basename "${videos[0]}")"
-  "$WMRM" detect "${videos[0]}" --corner "$CORNER" --preset "$PRESET"
+  "${WMRM[@]}" detect "${videos[0]}" --corner "$CORNER" --preset "$PRESET"
 fi
 
 # --- process ------------------------------------------------------------------ #
@@ -118,7 +139,7 @@ for src in "${videos[@]}"; do
   fi
 
   log "$base"
-  if "$WMRM" run "$src" -o "$out" --preset "$PRESET" "${args[@]}"; then
+  if "${WMRM[@]}" run "$src" -o "$out" --preset "$PRESET" "${args[@]}"; then
     processed=$((processed + 1))
   else
     warn "FAILED: $base"
@@ -137,8 +158,8 @@ if [[ -f "$preview" ]]; then
   echo "  $preview"
   echo
   echo "If it was wrong: rm $PRESET, then measure and save the real box:"
-  echo "  $WMRM grid ${videos[0]} --corner $CORNER"
-  echo "  $WMRM detect ${videos[0]} --box X,Y,W,H --preset $PRESET"
+  echo "  $WMRM_SHOW grid ${videos[0]} --corner $CORNER"
+  echo "  $WMRM_SHOW detect ${videos[0]} --box X,Y,W,H --preset $PRESET"
   echo "and run this again."
 fi
 
