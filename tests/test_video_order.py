@@ -43,15 +43,21 @@ def make_source(path: Path) -> None:
         check=True)
 
 
-def stub_run_segment(order: list[int]):
+def stub_run_segment(order: list[int], live: list[int]):
     """Identity 'model' that returns segments in reverse order of submission.
 
     Later segments sleep less, so with workers > 1 they overtake the earlier ones.
     `order` records actual completion order so the test can assert the race really
     happened -- a passing test that never raced would prove nothing.
+
+    `live` records how many extracted input frames are still on disk each time a
+    segment runs. Purging is supposed to shrink that as the run proceeds, and
+    copying through `resolve()` means a frame purged too early fails loudly here
+    instead of silently producing a wrong video.
     """
     def run(opts, frames_dir: Path, mask_png: Path, out_dir: Path) -> Path:
         si = int(frames_dir.name.removeprefix("seg"))
+        live.append(len(list((frames_dir.parent / "tile").glob("*.png"))))
         time.sleep(max(0.0, 0.60 - 0.12 * si))
         got = out_dir / frames_dir.name / "frames"
         got.mkdir(parents=True)
@@ -62,9 +68,10 @@ def stub_run_segment(order: list[int]):
     return run
 
 
-def run_once(src: Path, dst: Path, workers: int, order: list[int]) -> None:
+def run_once(src: Path, dst: Path, workers: int, order: list[int],
+             live: list[int] | None = None) -> None:
     real = V._run_segment
-    V._run_segment = stub_run_segment(order)
+    V._run_segment = stub_run_segment(order, live if live is not None else [])
     try:
         V.run_propainter(
             src, dst,
@@ -105,10 +112,21 @@ def main() -> int:
 
         baseline = work / "w1.mp4"
         order1: list[int] = []
-        run_once(src, baseline, 1, order1)
+        live1: list[int] = []
+        run_once(src, baseline, 1, order1, live1)
         print(f"workers=1  completion order: {order1}")
         if order1 != sorted(order1):
             print("FAIL  serial run did not complete in order -- test is broken")
+            failures += 1
+
+        # Serial is where purging is most visible: each segment starts with fewer
+        # input frames on disk than the one before it. Flat counts mean the purge
+        # never fired and peak disk is still two full copies of the tile.
+        if live1 == sorted(live1, reverse=True) and live1[0] > live1[-1]:
+            print(f"PASS  input frames purged as consumed: {live1} -> "
+                  f"{FRAMES} extracted, {live1[-1]} still live at the last segment")
+        else:
+            print(f"FAIL  input frames were not purged: {live1}")
             failures += 1
 
         for workers in (2, 3, 5):

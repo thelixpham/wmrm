@@ -520,7 +520,10 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                         "This, not --pp-segment, is what caps VRAM during inference: "
                         "measured on an A40, a 1827-frame segment held only 10 GiB of "
                         "45 because the model still worked 80 frames at a time. "
-                        "Raising it trades VRAM for fewer chunk boundaries")
+                        "Raising it buys nothing measurable though -- 80 vs 200 on "
+                        "that A40 came out 284s vs 283s, while two runs of the same "
+                        "setting varied by 19s, so the knob is inside the noise. "
+                        "Left exposed for other hardware, not as a recommendation")
     p.add_argument("--pp-workers", type=int, default=1,
                    help="segments to run concurrently (default 1). Output is "
                         "identical either way, so this is purely a speed knob. How "

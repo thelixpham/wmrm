@@ -259,6 +259,30 @@ def run_propainter(
                 (seg_in / f"{j - lo:06d}.png").symlink_to(src_frames[j])
             plan.append((si, seg_in, work / f"out{si:04d}", start, end, lo, hi))
 
+        # Input frames are deleted once no remaining segment can still read them.
+        #
+        # Without this, `tile/` holds every extracted frame until the run ends even
+        # though a frame is dead the moment the last segment covering it finishes.
+        # Both directories then grow together and peak disk is two full copies of the
+        # tile -- 104 GB for ten hours of footage, measured at 48.1 KB per frame.
+        # Purging as we go makes the total stay at one copy instead: at any moment the
+        # undeleted input and the accumulated output sum to the same constant, so peak
+        # disk halves and no longer depends on where in the video we are.
+        pending = {it[0] for it in plan}
+        purged = 0
+
+        def purge_consumed() -> None:
+            nonlocal purged
+            # The floor is the earliest frame any *unfinished* segment still needs.
+            # Taking the minimum over pending segments rather than assuming they
+            # finish in order is what makes this correct under --pp-workers > 1,
+            # where a later segment can complete while an earlier one is still
+            # running and still holding symlinks into these files.
+            floor = min((plan[i][5] for i in pending), default=n)
+            while purged < floor:
+                src_frames[purged].unlink(missing_ok=True)
+                purged += 1
+
         def collect(item, got: Path) -> int:
             """Move one finished segment's kept frames into `clean`."""
             si, seg_in, out_dir, start, end, lo, hi = item
@@ -271,6 +295,8 @@ def run_propainter(
                 shutil.copyfile(produced[j - lo], clean / f"{j:06d}.png")
             shutil.rmtree(seg_in, ignore_errors=True)
             shutil.rmtree(out_dir, ignore_errors=True)
+            pending.discard(si)
+            purge_consumed()
             return end - start
 
         workers = max(1, min(opts.workers, len(plan)))
@@ -380,6 +406,9 @@ def run_propainter(
             cmd += ["-movflags", "+faststart"]
         cmd.append(str(tmp))
 
+        # With input purging the footprint is flat across the run -- what is left
+        # here at the end (the full `clean/`, an empty `tile/`) is also the maximum,
+        # so one walk at this point is an honest peak rather than a final reading.
         peak_bytes = _dir_bytes(work)
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
@@ -401,7 +430,8 @@ def run_propainter(
     say(f"[pp] TOTAL {_hms(total)} for {n} frames "
         f"({n / max(total, 1e-6):.2f} fps, "
         f"{total / max(info.duration, 1e-6):.1f}x realtime)  "
-        f"peak temp disk {_sizeof(peak_bytes)}")
+        f"peak temp disk {_sizeof(peak_bytes)} ({purged} input frames purged "
+        f"as segments consumed them)")
     # Extrapolate, because a one-minute test says nothing about the videos this is
     # actually for until it is scaled up.
     say(f"[pp] EXTRAPOLATED  1 hour of this footage -> "
