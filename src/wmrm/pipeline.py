@@ -64,11 +64,13 @@ def _encoder_cmd(ffmpeg: str, dst: Path, info: VideoInfo, opts: EncodeOpts) -> l
         "-pix_fmt", "yuv420p",
         # bit-exact audio passthrough; re-encoding to AAC every pass is pure loss
         "-c:a", "copy",
-        # NO -shortest. It ends the output when the shortest stream ends, and real
-        # files routinely have an audio track shorter than the video -- one source
-        # here was 2.6s short, which silently truncated 78 frames off the end. The
-        # rawvideo input on stdin terminates by itself, so it bought nothing.
-        # Measured on a 151-frame clip: with -shortest 150 frames, without it 151.
+        # NO -shortest. It ends the output when the *shortest* input stream ends, and
+        # real files routinely carry an audio track shorter than the video: one
+        # source here ran 2.6s short, which silently cut 78 frames off the tail and
+        # showed up only as a duration mismatch in verify. The rawvideo input on
+        # stdin terminates by itself when we stop writing, so -shortest never bought
+        # anything here. Measured on a 151-frame clip: with it 150 frames, without
+        # it 151.
     ]
     if opts.faststart:
         cmd += ["-movflags", "+faststart"]
@@ -299,7 +301,7 @@ def run_fast(
             "-c:v", "libx264", "-crf", str(encode.crf), "-preset", encode.x264_preset,
             # No -shortest: it truncates the video to a shorter audio track. The
             # looped mask input is bounded by `shortest=1` on the overlay filter
-            # instead, which ends the graph without touching the muxer.
+            # above instead, which ends the filter graph without touching the muxer.
             "-pix_fmt", "yuv420p", "-c:a", "copy",
         ]
         if encode.faststart:

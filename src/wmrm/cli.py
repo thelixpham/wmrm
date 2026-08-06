@@ -152,8 +152,7 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
             opts=ProPainterOpts(repo=find_repo(args.propainter),
                                 segment=args.pp_segment,
                                 raft_iter=args.raft_iter,
-                                fp16=not args.no_fp16,
-                                workers=args.pp_workers),
+                                fp16=not args.no_fp16),
         )
     if args.quality == "fast":
         return run_fast(
@@ -514,10 +513,6 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pp-segment", type=int, default=400,
                    help="frames per ProPainter invocation (default 400). It loads a "
                         "whole segment into memory, so lower this if you run out")
-    p.add_argument("--pp-workers", type=int, default=1,
-                   help="segments to run concurrently (default 1). The tile is small "
-                        "for a modern GPU, so 2-4 often scales nearly linearly. "
-                        "Watch the reported fps and back off on out-of-memory")
     p.add_argument("--raft-iter", type=int, default=20,
                    help="ProPainter optical-flow iterations (default 20). Lower is "
                         "faster and less accurate")
