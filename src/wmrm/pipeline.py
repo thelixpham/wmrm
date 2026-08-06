@@ -84,7 +84,7 @@ def _fmt_eta(seconds: float) -> str:
     return f"{seconds / 60:.1f}m"
 
 
-def _read_exact(stream, view: memoryview) -> int:
+def read_exact(stream, view: memoryview) -> int:
     """Fill `view` from `stream`, looping over short reads.
 
     A pipe hands back whatever is buffered -- typically 64 KB, far less than one
@@ -102,7 +102,7 @@ def _read_exact(stream, view: memoryview) -> int:
     return off
 
 
-def _drain(pipe) -> str:
+def drain(pipe) -> str:
     if pipe is None:
         return ""
     try:
@@ -162,7 +162,7 @@ def run_inpaint(
         buf = bytearray(frame_bytes)
         view = memoryview(buf)
         while True:
-            got = _read_exact(dec.stdout, view)
+            got = read_exact(dec.stdout, view)
             if got == 0:
                 break  # clean end of stream
             if got < frame_bytes:
@@ -207,9 +207,9 @@ def run_inpaint(
         # frames that nobody is draining any more. Stop it first, then read.
         if dec.poll() is None:
             dec.kill()
-        dec_err = _drain(dec.stderr)
+        dec_err = drain(dec.stderr)
         dec.wait()
-        enc_err = _drain(enc.stderr)
+        enc_err = drain(enc.stderr)
         enc.wait()
 
     if broken:

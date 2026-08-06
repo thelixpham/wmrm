@@ -149,7 +149,12 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
             dilate_px=preset.dilate_px, feather_px=preset.feather_px,
             margin_px=preset.margin_px, encode=encode,
             progress=not args.quiet,
+            # --device now reaches this path. It used to be accepted and silently
+            # ignored here: upstream's script has no device flag, so a CUDA box that
+            # failed the cudnn check fell back to CPU without saying so, at ~400x the
+            # cost. The worker takes it, and 'auto' still means its own rule.
             opts=ProPainterOpts(repo=find_repo(args.propainter),
+                                device=args.device,
                                 segment=args.pp_segment,
                                 subvideo_length=args.pp_subvideo,
                                 raft_iter=args.raft_iter,
@@ -453,6 +458,19 @@ def cmd_coverage(args) -> int:
         s = result.suggested
         print(f"\nre-check with:\n  wmrm coverage {src} "
               f"--box {s.x},{s.y},{s.w},{s.h}")
+
+    # Three verdicts, three exit codes, because a caller automating this needs to
+    # tell them apart. `ok` folds INCONCLUSIVE in with UNDER-COVERED, which is right
+    # for a human reading the text and wrong for a gate: under-covered means the box
+    # is provably too small, while inconclusive means the background is itself static
+    # and no statistic can answer -- blocking on that would reject clips that are
+    # fine, and there is nothing the caller could do about it except look.
+    #
+    #   0  covered
+    #   1  UNDER-COVERED -- the box is too small, a suggestion was printed
+    #   2  INCONCLUSIVE  -- unanswerable here, fall back to the preview and your eyes
+    if result.inconclusive:
+        return 2
     return 0 if result.ok else 1
 
 

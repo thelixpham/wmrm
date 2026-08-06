@@ -9,12 +9,24 @@
 #   ./run.sh /data/videos x.mp4     folders and files mixed
 #
 # How it picks the watermark box:
-#   - PRESET exists  -> use it. Deterministic, no guessing.
-#   - otherwise      -> detect once on the first video, SAVE it as PRESET, then
-#                       use that one box for everything.
+#   - PRESET exists  -> use it for everything. Deterministic, no guessing.
+#   - DETECT=each    -> detect per video (the default). Right when the batch is
+#                       mixed: a box measured on one source is meaningless for a
+#                       different crop, a different logo or a different placement,
+#                       and normalized coordinates only rescue a resolution change.
+#   - DETECT=once    -> detect on the first video, save it as PRESET, reuse it.
+#                       Right when every file is the same watermark from the same
+#                       pipeline: one box, one preview, one decision.
 #
-# So the first run calibrates itself and every run after it is repeatable. Check
-# the preview PNG it points you at -- detection is a guess, not a guarantee.
+# Detecting per video buys a better fit and costs the single point where a human
+# confirmed the box. COVERAGE=1 (also the default) buys that back: every detected
+# box is checked against the frame it came from before a pixel is touched, and a box
+# that is provably too small stops that file instead of quietly shipping a video
+# with watermark fringe left in it. Verdicts are summarised at the end, so one bad
+# guess among fifty good ones is loud rather than invisible.
+#
+# Detection is still a guess with measured failure modes -- see the README table.
+# Look at the preview PNGs this prints at the end.
 
 set -euo pipefail
 
@@ -25,8 +37,14 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 INBOX="${INBOX:-$HERE/inbox}"     # used only when no arguments are given
 OUTBOX="${OUTBOX:-$HERE/outbox}"
+# Was PRESET named on the command line, or is this just the default path? The
+# difference decides whether an existing preset.json is an instruction or a leftover.
+if [[ -n "${PRESET:-}" ]]; then PRESET_GIVEN=1; else PRESET_GIVEN=0; fi
 PRESET="${PRESET:-$HERE/preset.json}"
 CORNER="${CORNER:-tr}"            # tr tl br bl -- where the watermark sits
+DETECT="${DETECT:-each}"          # each = detect per video, once = one box for all
+COVERAGE="${COVERAGE:-1}"         # 1 = gate every detected box on `wmrm coverage`
+CLEAN="${CLEAN:-1}"               # 1 = delete our own leftovers for files that passed
 QUALITY="${QUALITY:-}"            # empty = the CLI default (un-blend). Override with
                                   # "high" for an opaque mark, "fast" if ffmpeg-only
 EXTRA="${EXTRA:-}"                # anything else, e.g. EXTRA="--device cuda"
@@ -115,19 +133,81 @@ args=()
 # shellcheck disable=SC2206  # deliberate word-splitting of user-supplied flags
 [[ -n "$EXTRA" ]] && args+=($EXTRA)
 
-# --- one box for the whole run ------------------------------------------------- #
-# Detect once, save it, then process everything from the saved preset. Detecting
-# per file is what makes unattended runs dangerous: each file gets a different
-# box, so one bad guess is invisible among the good ones.
-if [[ -f "$PRESET" ]]; then
-  log "using saved box from $(basename "$PRESET")"
+# --- how the box gets decided -------------------------------------------------- #
+# A preset you *named* always wins: it is the only box a human deliberately measured
+# and froze, and guessing over the top of it would throw away the one thing here that
+# is not a guess.
+#
+# A preset that merely happens to exist at the default path does not win, and that
+# asymmetry is the point. It used to: a leftover preset.json from an earlier
+# DETECT=once run would silently stop all detection, so the tool quietly did
+# something other than what the default asks for. Now it says so and carries on.
+[[ "$DETECT" == "each" || "$DETECT" == "once" ]] \
+  || die "DETECT must be 'each' or 'once', got '$DETECT'"
+
+shared_preset=""
+if [[ -f "$PRESET" && "$PRESET_GIVEN" == "1" ]]; then
+  log "using the box you named: $PRESET"
+  shared_preset="$PRESET"
+elif [[ "$DETECT" == "once" ]]; then
+  if [[ -f "$PRESET" ]]; then
+    log "using the saved box in $(basename "$PRESET") for all ${#videos[@]} file(s)"
+  else
+    log "DETECT=once -- detecting on $(basename "${videos[0]}"), reusing for all"
+    "${WMRM[@]}" detect "${videos[0]}" --corner "$CORNER" --preset "$PRESET"
+  fi
+  shared_preset="$PRESET"
 else
-  log "no preset yet -- detecting on $(basename "${videos[0]}")"
-  "${WMRM[@]}" detect "${videos[0]}" --corner "$CORNER" --preset "$PRESET"
+  if [[ -f "$PRESET" ]]; then
+    warn "note: $(basename "$PRESET") exists but is being ignored -- the default is"
+    warn "      to detect each video on its own. DETECT=once uses it instead."
+  fi
+  log "detecting each video on its own"
 fi
+
+# --- cleanup ------------------------------------------------------------------- #
+# Delete what this script generated, and only for files nothing needs re-checking on.
+# Never the input, never the output, never a file we did not create: preview PNGs sit
+# next to someone's source footage, so the pattern has to be exact rather than a glob
+# over that directory.
+#
+# The condition is the point. A file whose box was confirmed `covered` has nothing
+# left to look at, so its preview is 465 KB of noise beside the original. A file that
+# came back INCONCLUSIVE has exactly one thing that can still settle it -- the preview
+# -- so deleting that would be deleting the evidence.
+cleaned_bytes=0
+clean_up() {   # <src> <preset> <base>
+  [[ "$CLEAN" == "1" ]] || return 0
+  local src="$1" preset="$2" base="$3" f
+  # Keep everything for the files flagged for a human.
+  for flagged in ${inconclusive[@]+"${inconclusive[@]}"}; do
+    [[ "$flagged" == "$base" ]] && return 0
+  done
+
+  local victims=("${src%.*}-preview.png" "${src%.*}-preview-zoom.png")
+  # Per-file presets only. A shared preset is either yours or this run's calibration
+  # for every remaining file -- deleting it mid-run would break the files after this
+  # one, and deleting it at the end would throw away the repeatability it exists for.
+  [[ -z "$shared_preset" && "$preset" == "$presetdir/"* ]] && victims+=("$preset")
+
+  for f in "${victims[@]}"; do
+    if [[ -f "$f" ]]; then
+      cleaned_bytes=$(( cleaned_bytes + $(stat -c %s "$f" 2>/dev/null || echo 0) ))
+      rm -f -- "$f"
+    fi
+  done
+}
+
+# Per-file presets are kept for the files that need a second look. They are the record
+# of what box each output was actually made with, which is the first thing anyone asks
+# when one output looks wrong.
+presetdir="$OUTBOX/.presets"
+mkdir -p "$presetdir"
 
 # --- process ------------------------------------------------------------------ #
 processed=0 skipped=0 failed=0 failed_names=()
+undercovered=() inconclusive=() previews=()
+
 for src in "${videos[@]}"; do
   base="$(basename "$src")"
   out="$OUTBOX/${base%.*}-clean.${base##*.}"
@@ -139,8 +219,50 @@ for src in "${videos[@]}"; do
   fi
 
   log "$base"
-  if "${WMRM[@]}" run "$src" -o "$out" --preset "$PRESET" "${args[@]}"; then
+
+  # 1. the box for this file
+  if [[ -n "$shared_preset" ]]; then
+    preset="$shared_preset"
+  else
+    preset="$presetdir/${base%.*}.json"
+    if ! "${WMRM[@]}" detect "$src" --corner "$CORNER" --preset "$preset"; then
+      warn "FAILED (detect found nothing): $base"
+      failed=$((failed + 1)); failed_names+=("$base [detect]")
+      continue
+    fi
+    p="${src%.*}-preview-zoom.png"
+    [[ -f "$p" ]] && previews+=("$p")
+  fi
+
+  # 2. gate it. Exit codes from `wmrm coverage`: 0 covered, 1 under-covered,
+  #    2 inconclusive. Only 1 is a provable defect, so only 1 stops the file --
+  #    inconclusive means the background is static and no statistic can answer,
+  #    which is a reason to look at the preview, not a reason to refuse the work.
+  if [[ "$COVERAGE" == "1" ]]; then
+    set +e
+    "${WMRM[@]}" coverage "$src" --preset "$preset"
+    cov=$?
+    set -e
+    case "$cov" in
+      0) ;;
+      1) warn "SKIPPED: $base -- box is too small, watermark extends outside it."
+         warn "         Re-run with a bigger box, or COVERAGE=0 to process anyway."
+         undercovered+=("$base")
+         failed=$((failed + 1)); failed_names+=("$base [under-covered]")
+         continue ;;
+      2) warn "$base -- coverage INCONCLUSIVE (static background). Processing; "
+         warn "         confirm this one by eye."
+         inconclusive+=("$base") ;;
+      *) warn "$base -- coverage check itself failed (exit $cov). Processing; "
+         warn "         confirm this one by eye."
+         inconclusive+=("$base") ;;
+    esac
+  fi
+
+  # 3. process
+  if "${WMRM[@]}" run "$src" -o "$out" --preset "$preset" "${args[@]}"; then
     processed=$((processed + 1))
+    clean_up "$src" "$preset" "$base"
   else
     warn "FAILED: $base"
     failed=$((failed + 1)); failed_names+=("$base")
@@ -151,16 +273,59 @@ log "done: $processed processed, $skipped skipped, $failed failed"
 echo "Results: $OUTBOX"
 (( failed )) && warn "failed: ${failed_names[*]}"
 
-preview="${videos[0]%.*}-preview-zoom.png"
-if [[ -f "$preview" ]]; then
+# The whole point of gating per file is that a bad box is loud. Repeat the verdicts
+# here: nobody scrolls back through fifty files of log.
+if (( ${#undercovered[@]} )); then
   echo
-  echo "Confirm the red box covered the whole watermark:"
-  echo "  $preview"
+  warn "NOT PROCESSED -- detected box too small (${#undercovered[@]} file(s)):"
+  for f in "${undercovered[@]}"; do warn "  $f"; done
+  warn "For each, measure the box by hand and freeze it:"
+  warn "  $WMRM_SHOW grid <file> --corner $CORNER"
+  warn "  $WMRM_SHOW coverage <file> --box X,Y,W,H"
+  warn "  $WMRM_SHOW detect <file> --box X,Y,W,H --preset $PRESET"
+fi
+if (( ${#inconclusive[@]} )); then
   echo
-  echo "If it was wrong: rm $PRESET, then measure and save the real box:"
-  echo "  $WMRM_SHOW grid ${videos[0]} --corner $CORNER"
-  echo "  $WMRM_SHOW detect ${videos[0]} --box X,Y,W,H --preset $PRESET"
-  echo "and run this again."
+  warn "PROCESSED BUT UNVERIFIED -- coverage could not answer (${#inconclusive[@]} file(s)):"
+  for f in "${inconclusive[@]}"; do warn "  $f"; done
+  warn "The background is static there, so no statistic separates mark from wall."
+  warn "Check these by eye before shipping them."
+fi
+
+if [[ -n "$shared_preset" ]]; then
+  preview="${videos[0]%.*}-preview-zoom.png"
+  if [[ -f "$preview" ]]; then
+    echo
+    echo "One box was used for everything. Confirm it covered the whole watermark:"
+    echo "  $preview"
+    echo
+    echo "If it was wrong: rm $PRESET, then measure and save the real box:"
+    echo "  $WMRM_SHOW grid ${videos[0]} --corner $CORNER"
+    echo "  $WMRM_SHOW detect ${videos[0]} --box X,Y,W,H --preset $PRESET"
+    echo "and run this again."
+  fi
+else
+  # Only the previews still on disk. CLEAN deletes the ones for files that passed the
+  # coverage gate, so what is left here is exactly the set worth opening -- pointing
+  # at a path we just removed would be worse than saying nothing.
+  kept=()
+  for p in ${previews[@]+"${previews[@]}"}; do
+    [[ -f "$p" ]] && kept+=("$p")
+  done
+  if (( ${#kept[@]} )); then
+    echo
+    echo "Previews kept for the files that still need an eye (${#kept[@]}):"
+    for p in "${kept[@]:0:10}"; do echo "  $p"; done
+    (( ${#kept[@]} > 10 )) && echo "  ... and $(( ${#kept[@]} - 10 )) more"
+    echo "Boxes used: $presetdir"
+  fi
+fi
+
+if (( cleaned_bytes )); then
+  echo
+  printf 'cleaned up %s of previews and per-file presets for the files that passed.\n' \
+    "$(numfmt --to=iec --suffix=B "$cleaned_bytes" 2>/dev/null || echo "$cleaned_bytes bytes")"
+  echo "CLEAN=0 keeps them."
 fi
 
 (( failed )) && exit 1
