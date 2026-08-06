@@ -83,6 +83,32 @@ def scene_cuts(ffmpeg: str, src: Path, threshold: float) -> list[float]:
     return sorted(out)
 
 
+def signals(ffmpeg: str, orig: Path, proc: Path, tile: Box,
+            mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The two per-frame signals, for any caller that wants numbers not a report.
+
+    fill : mean |output - input| inside the mask. Always nonzero -- that is the
+           watermark being removed. Spikes mean an unusual fill.
+    jump : how much the output patch moves frame to frame, minus how much the source
+           does. Near zero when the patch tracks the content; a blob that appears and
+           vanishes shows up here even when its absolute value looks plausible.
+    """
+    fill: list[float] = []
+    jump: list[float] = []
+    prev_o = prev_p = None
+    for a, b in zip(tile_stream(ffmpeg, orig, tile), tile_stream(ffmpeg, proc, tile)):
+        ao = a[mask].astype(np.int16)
+        bo = b[mask].astype(np.int16)
+        fill.append(float(np.abs(bo - ao).mean()))
+        if prev_o is None:
+            jump.append(0.0)
+        else:
+            jump.append(float(np.abs(bo - prev_p).mean())
+                        - float(np.abs(ao - prev_o).mean()))
+        prev_o, prev_p = ao, bo
+    return np.array(fill), np.array(jump)
+
+
 def robust_z(x: np.ndarray) -> np.ndarray:
     """Deviation in MAD units. Zero-variance input gives zeros, not NaN."""
     med = float(np.median(x))
@@ -137,30 +163,14 @@ def main() -> int:
     print(f"tile {tile.w}x{tile.h} at {tile.x},{tile.y}  "
           f"mask {int(mask.sum())} px  fps {fps:.3f}")
 
-    fill: list[float] = []
-    jump: list[float] = []
-    prev_o = prev_p = None
-    for a, b in zip(tile_stream(ffmpeg, orig, tile), tile_stream(ffmpeg, proc, tile)):
-        ao = a[mask].astype(np.int16)
-        bo = b[mask].astype(np.int16)
-        fill.append(float(np.abs(bo - ao).mean()))
-        if prev_o is None:
-            jump.append(0.0)
-        else:
-            d_out = float(np.abs(bo - prev_p).mean())
-            d_src = float(np.abs(ao - prev_o).mean())
-            jump.append(d_out - d_src)
-        prev_o, prev_p = ao, bo
-
-    n = len(fill)
+    f, j = signals(ffmpeg, orig, proc, tile, mask)
+    n = len(f)
     if n == 0:
         raise SystemExit("error: decoded 0 frames -- do the two videos match?")
     print(f"compared {n} frames (source reports {info.nframes})")
     if info.nframes and abs(n - info.nframes) > 1:
         print(f"WARNING  frame counts differ by {abs(n - info.nframes)}")
 
-    f = np.array(fill)
-    j = np.array(jump)
     zf, zj = robust_z(f), robust_z(j)
     print(f"fill  median {np.median(f):.2f}  max {f.max():.2f}")
     print(f"jump  median {np.median(j):.2f}  max {j.max():.2f}")

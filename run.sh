@@ -146,8 +146,16 @@ args=()
   || die "DETECT must be 'each' or 'once', got '$DETECT'"
 
 shared_preset=""
-if [[ -f "$PRESET" && "$PRESET_GIVEN" == "1" ]]; then
-  log "using the box you named: $PRESET"
+if [[ "$PRESET_GIVEN" == "1" ]]; then
+  # Naming a preset path is a request for one shared, saved box -- whether or not the
+  # file exists yet. Existing: use it. Missing: calibrate once and write it there,
+  # which is the only reading of `PRESET=x.json` that makes sense on a first run.
+  if [[ -f "$PRESET" ]]; then
+    log "using the box you named: $PRESET"
+  else
+    log "no $PRESET yet -- detecting on $(basename "${videos[0]}") and saving it there"
+    "${WMRM[@]}" detect "${videos[0]}" --corner "$CORNER" --preset "$PRESET"
+  fi
   shared_preset="$PRESET"
 elif [[ "$DETECT" == "once" ]]; then
   if [[ -f "$PRESET" ]]; then

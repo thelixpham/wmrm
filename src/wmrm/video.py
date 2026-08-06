@@ -220,11 +220,37 @@ def _lands_on_cpu(device: str | None) -> bool:
     return True
 
 
-def _load_worker(opts: ProPainterOpts):
-    """Import the resident worker out of the checkout and construct it.
+# Keyed on what actually determines the loaded model: where it came from, the device
+# it lives on, and its dtype. Everything else in ProPainterOpts is an inference knob
+# read per call, so it is reassigned on a hit rather than forcing a reload.
+#
+# Scope worth being clear about: this is per *process*. `wmrm batch` processes a whole
+# folder in one process and gains the whole saving; run.sh invokes `wmrm run` per file,
+# so it does not. Closing that gap means teaching `batch` the per-file detect and
+# coverage gate that run.sh does in bash.
+_WORKER_CACHE: dict[tuple[str, str, bool], object] = {}
 
-    Model loading happens here, once, and it is slow enough to be worth logging
-    around by the caller.
+
+def release_worker() -> None:
+    """Drop cached models. For a caller that needs the VRAM back mid-process."""
+    _WORKER_CACHE.clear()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def _load_worker(opts: ProPainterOpts) -> tuple[object, bool]:
+    """Get the resident worker, loading it only if this process has not already.
+
+    Returns (worker, was_cached).
+
+    The cache is why this returns a flag: loading is ~40-50s of the run, and a batch
+    used to pay it per file. `wmrm batch` over fifty clips spent three quarters of an
+    hour loading the same three files, which is the same defect this worker was written
+    to fix at the segment level, left in place one level up.
     """
     repo = Path(opts.repo)
     if not (repo / "wmrm_worker.py").is_file():
@@ -271,14 +297,26 @@ def _load_worker(opts: ProPainterOpts):
             "torch.cuda.is_available())\""
         )
 
-    return ProPainterWorker(device=device, opts=WorkerOpts(
+    knobs = WorkerOpts(
         subvideo_length=opts.subvideo_length,
         neighbor_length=opts.neighbor_length,
         ref_stride=opts.ref_stride,
         raft_iter=opts.raft_iter,
         mask_dilation=opts.mask_dilation,
         fp16=opts.fp16,
-    ))
+    )
+    key = (str(repo), str(device), bool(opts.fp16))
+    cached = _WORKER_CACHE.get(key)
+    if cached is not None:
+        # Inference knobs are read per call, so a change in them needs no reload.
+        # fp16 is not among them -- it is part of the key, because it decides the
+        # dtype the weights are held in.
+        cached.opts = knobs           # type: ignore[attr-defined]
+        return cached, True
+
+    worker = ProPainterWorker(device=device, opts=knobs)
+    _WORKER_CACHE[key] = worker
+    return worker, False
 
 
 def _decode_cmd(ffmpeg: str, src: Path, tile) -> list[str]:
@@ -458,10 +496,14 @@ def run_propainter(
 
     t_start = time.monotonic()
     t0 = time.monotonic()
-    worker = _load_worker(opts)
+    worker, reused = _load_worker(opts)
     t_load = time.monotonic() - t0
-    say(f"[pp] models loaded in {_hms(t_load)} (once for the whole video, not once "
-        f"per segment)")
+    if reused:
+        say(f"[pp] models already resident, reused in {_hms(t_load)} "
+            f"(loading is paid once per process, not once per file)")
+    else:
+        say(f"[pp] models loaded in {_hms(t_load)} (once for this process -- not per "
+            f"segment, and not per file in a batch)")
 
     t0 = time.monotonic()
     shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps))
