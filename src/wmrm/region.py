@@ -160,6 +160,39 @@ def _odd(n: int) -> int:
     return n if n % 2 == 1 else n + 1
 
 
+# ProPainter runs at a size cropped down to a multiple of 8 and cubic-resizes the
+# result back (`resize_frames` / `--save_frames` in its inference script), so a tile
+# whose extent is not a multiple of 8 comes back resampled: softened exactly over the
+# region being repaired, and misaligned by a fraction of a pixel against the frame it
+# is composited onto. The output PNG still has the tile's size, so a shape check
+# cannot see it -- which is how it went unnoticed.
+#
+# Our worker reflect-pads to the multiple of 8 instead of resizing, so alignment is
+# no longer required for correctness. It is still worth having: an aligned tile needs
+# no pad, and real neighbouring pixels are better context for the model than a
+# mirrored border.
+ALIGN_PX = 8
+
+
+def _align_span(lo: int, hi: int, limit: int, must_cover: int) -> tuple[int, int]:
+    """Snap [lo, hi) to a multiple of ALIGN_PX without uncovering `must_cover`.
+
+    Outward first, since the span past the box is only context and more of it is
+    free. When the frame edge blocks growing, the tail falls back to the previous
+    boundary instead -- that spends context, never coverage. If even that would cut
+    into `must_cover` the span is left unaligned and the worker pads it, so the
+    worst case here is a missed optimisation rather than a clipped watermark.
+    """
+    lo -= lo % ALIGN_PX
+    out = hi + (-hi % ALIGN_PX)
+    if out <= limit:
+        return lo, out
+    back = limit - limit % ALIGN_PX
+    if back >= must_cover and back > lo:
+        return lo, back
+    return lo, limit
+
+
 def build_region(
     box: Box,
     width: int,
@@ -174,13 +207,16 @@ def build_region(
     # Tile = box + margin. Keeping this small is the single biggest speed lever:
     # inpaint cost scales with tile pixels (KNOWLEDGE.md 7.1).
     #
-    # Offsets and extents are snapped to even numbers: ffmpeg's crop filter on
-    # yuv420p silently rounds odd values down to match chroma subsampling, and a
-    # tile that disagrees with the mask by one pixel fails to composite.
-    x0 = max(0, box.x - margin_px) & ~1
-    y0 = max(0, box.y - margin_px) & ~1
-    x1 = min(width, (min(width, box.x + box.w + margin_px) + 1) & ~1)
-    y1 = min(height, (min(height, box.y + box.h + margin_px) + 1) & ~1)
+    # Offsets and extents are snapped to a multiple of 8, which also satisfies the
+    # older even-number requirement: ffmpeg's crop filter on yuv420p silently rounds
+    # odd values down to match chroma subsampling, and a tile that disagrees with the
+    # mask by one pixel fails to composite. See ALIGN_PX for why 8 and not 2.
+    x0, x1 = _align_span(max(0, box.x - margin_px),
+                         min(width, box.x + box.w + margin_px),
+                         width, box.x + box.w)
+    y0, y1 = _align_span(max(0, box.y - margin_px),
+                         min(height, box.y + box.h + margin_px),
+                         height, box.y + box.h)
     tile = Box(x0, y0, x1 - x0, y1 - y0)
 
     # `core` must fully cover the watermark including its soft edge.

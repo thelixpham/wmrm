@@ -33,6 +33,12 @@ MUST_IGNORE = [
     "sample-boxcheck-zoom.png",
     ".busy-marked.a1b2c3.mp4",   # atomic-write temp
     "big-lama.pt",
+    # ProPainter's downloaded weights, 191 MB. Covered twice over: by *.pth and by
+    # the directory rule. The second entry is a file the extension rules do NOT
+    # match, so it fails if the directory rule is ever dropped and leaves only the
+    # extension rules standing.
+    "vendor/ProPainter/weights/ProPainter.pth",
+    "vendor/ProPainter/weights/README-from-upstream.txt",
 ]
 
 MUST_TRACK = [
@@ -45,6 +51,16 @@ MUST_TRACK = [
     "tests/score.py",
     # the calibration result is worth committing once confirmed
     "wm-preset.json",
+    # Vendored ProPainter is source now, not a nested checkout, so it has to be
+    # tracked -- an over-broad ignore rule here would silently produce a repo that
+    # cannot run --quality video at all.
+    "vendor/README.md",
+    "vendor/ProPainter/inference_propainter.py",
+    "vendor/ProPainter/wmrm_worker.py",
+    "vendor/ProPainter/model/propainter.py",
+    # Keeping this tracked is a license condition, not a preference: S-Lab 1.0
+    # clauses 1 and 2 require the notice to travel with the source.
+    "vendor/ProPainter/LICENSE",
 ]
 
 PARENT_MUST_IGNORE = [
