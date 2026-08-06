@@ -21,21 +21,48 @@ the results in `outbox/`.
 ./run.sh /data/videos x.mp4     # folders and files mixed
 ```
 
-The first run detects the watermark and **saves the box to `preset.json`**. Every
-run after that reuses it, so results are repeatable instead of re-guessed. Delete
-`preset.json` to recalibrate.
+**It detects the watermark on every video, separately**, then checks that box
+before touching a pixel. A box measured on one source says nothing about a
+different crop, a different logo or a different placement, so a shared box is only
+right when you know the batch is uniform.
+
+Every detected box is gated by `wmrm coverage`. A box that is provably too small
+**stops that file** rather than shipping a video with watermark fringe still in it,
+and the ones it could not answer for are listed again at the end for you to eyeball.
+
+It cleans up after itself. A file whose box came back `covered` has nothing left to
+check, so its preview PNGs (~465 KB a file) and its saved box are deleted. Files that
+were stopped or came back `INCONCLUSIVE` keep theirs — those are the evidence, and
+`outbox/.presets/` is the record of what box each of them was made with. Your inputs
+and outputs are never touched.
+
+If your batch *is* uniform — same watermark, same pipeline — one box is better:
+it is repeatable, and there is one preview to check instead of fifty.
+
+```bash
+DETECT=once ./run.sh                # detect on the first file, reuse for all
+```
+
+That saves the box to `preset.json`, and an existing `preset.json` always wins over
+any detection. Delete it to recalibrate.
 
 Tune it with environment variables, no flags to remember:
 
 ```bash
 CORNER=tl ./run.sh                  # watermark is top-left
 QUALITY=video ./run.sh              # mark must be COMPLETELY gone (needs a GPU)
+DETECT=once ./run.sh                # one box for the whole run
+COVERAGE=0 ./run.sh                 # process even boxes that fail the coverage check
+CLEAN=0 ./run.sh                    # keep every preview, not just the ones worth looking at
 FORCE=1 ./run.sh                    # redo files already in outbox
 OUTBOX=/data/out ./run.sh clip.mp4
 ```
 
 `FORCE=1` matters more than it looks: without it, files already in `outbox/` are
 skipped, so after changing anything you will be looking at the **old** output.
+
+`COVERAGE=0` is for when you have looked and disagree with the check — it is not a
+speed lever, and it turns a stopped file into a silently bad one.
 
 <details>
 <summary>Prefer the CLI directly?</summary>
@@ -368,12 +395,12 @@ It is [ProPainter](https://github.com/sczhou/ProPainter): optical flow between f
 so the hole is filled with the same content seen uncovered a few frames earlier or
 later. On this footage the leaves move, so that content genuinely exists.
 
-One-time setup — it is a research repo, not a package, so there is nothing to pip
-install:
+**No clone needed any more.** ProPainter is vendored at `vendor/ProPainter` (upstream
+commit and what was cut: `vendor/README.md`), because it is a research repo with
+nothing to pip install and the pipeline imports it rather than shelling out to it.
+Only the extra Python packages are left to install:
 
 ```bash
-git clone https://github.com/sczhou/ProPainter.git
-export PROPAINTER_HOME=$PWD/ProPainter          # or clone it beside this project
 uv pip install av addict einops future scipy scikit-image imageio-ffmpeg \
                pyyaml requests timm matplotlib
 uv pip install --index-url https://download.pytorch.org/whl/cu124 torchvision
@@ -383,7 +410,13 @@ The `torchvision` line is not optional and must come from the **same index as yo
 torch**. A PyPI torchvision next to a `+cu124` torch fails with
 `operator torchvision::nms does not exist`, which does not mention either package.
 
-Weights (~190 MB total) download themselves on first run.
+Weights (~190 MB total) download themselves on first run, into
+`vendor/ProPainter/weights/`. They are gitignored — GitHub rejects blobs over 100 MB,
+and a binary that size cannot be taken back out of history cleanly.
+
+`PROPAINTER_HOME` still overrides the vendored copy if you need to test against a
+different upstream. Point it at a checkout that has `wmrm_worker.py` copied into it,
+or the run fails with an explanation — that file is ours, not upstream's.
 
 ```bash
 QUALITY=video ./run.sh                    # or:
@@ -394,19 +427,44 @@ Speed: **9m14s for 151 frames of 1080p on 6 CPU cores** — do not run it on CPU
 real work. Expect 20–50× that on CUDA. The log's `[cfg] device` line tells you which
 you got, using ProPainter's own selection rule.
 
-Knobs, in the order worth touching: `--pp-segment` (frames per invocation, default
-400 — lower it if you run out of memory, since it loads a whole segment at once),
-`--raft-iter` (flow iterations, default 20; lower is faster and rougher), `--no-fp16`.
+Knobs, in the order worth touching: `--pp-segment` (frames per model call, default
+400 — lower it if you run out of memory, since the model materialises a whole segment
+as a tensor), `--raft-iter` (flow iterations, default 20; lower is faster and
+rougher), `--no-fp16`, `--device cuda` to make a CPU fallback a hard failure instead
+of a silent 400× slowdown.
 
-Two things this wrapper does that matter:
+`--pp-workers` is **accepted and ignored**. It used to overlap the per-segment model
+*load* with another segment's compute, which mattered when every segment was a fresh
+process. There is one resident model now, so there is no load left to hide, and two
+segments handed to the same device would serialise on it anyway.
 
-- **It reads ProPainter's PNG frames, never its mp4.** Its writer pads to a multiple
-  of 16 — `resizing from (400, 168) to (400, 176)` — so the mp4 no longer lines up
-  with the crop it came from. There is an assertion on the tile size for this.
-- **It segments the clip with discarded overlap.** `--subvideo_length` only chunks
-  inference; the script still loads every frame it is handed into memory first, so an
-  unsegmented hour of video does not fit. Overlap frames give the model context on
-  both sides of every frame that is kept, so the joins do not show.
+Four things this wrapper does that matter:
+
+- **Nothing is written to disk.** Frames stream: one ffmpeg decodes and crops the tile
+  into a pipe, the model works in memory, a second ffmpeg composites the result back
+  over the untouched source. The older shape of this wrote every tile frame as a PNG
+  first, so an hours-long video paid for a million PNG encodes before the model saw
+  frame one, and temp disk grew with duration (48.1 KB/frame — ~83 GB for ten hours).
+  Peak is now a few hundred MB of in-flight frames, flat in video length.
+- **Decode, model and composite run at the same time**, each in its own thread with a
+  bounded queue between them. Bounded is the point: the queues are what keeps memory
+  flat when one stage is slower than the others.
+- **The models load once per run, not once per segment.** Upstream's inference sits
+  entirely inside `if __name__ == '__main__':`, so a subprocess per segment reloaded
+  RAFT, the flow-completion net and the inpaint generator every time — ~190 MB and a
+  CUDA context, ~2700 times on a ten-hour video at the default segment size.
+  `vendor/ProPainter/wmrm_worker.py` is the importable equivalent, and
+  `tests/test_propainter_parity.py` asserts it produces what the script produced,
+  bit for bit.
+- **It pads to a multiple of 8 rather than resizing.** Upstream crops its processing
+  size down to a multiple of 8 and cubic-resizes the result back, so a tile that was
+  not a multiple of 8 came back resampled — softened over exactly the pixels being
+  repaired, and off by a fraction of a pixel against the frame it is composited onto.
+  The output kept its requested dimensions, which is why a shape assertion never saw
+  it. Tiles are now aligned in `region.py` as well, so padding is usually a no-op.
+
+Overlap between segments is still discarded on both sides, so the model always has
+temporal context either side of every frame that is kept and the joins do not show.
 
 ### Which `--quality`, and how long it takes
 

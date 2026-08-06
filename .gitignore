@@ -43,6 +43,17 @@ tests/fixtures/
 *.pth
 *.ckpt
 
+# ProPainter's weights land here rather than in the torch cache, because the
+# vendored worker pins load_file_from_url to its own directory (a relative
+# 'weights' would resolve against the caller's cwd). 191 MB across three files,
+# fetched from GitHub releases on first run. Ignored by directory as well as by
+# extension: the *.pth rules above already cover today's three files, but this is
+# the rule that states the intent, and it survives upstream shipping a .zip or a
+# .pkl. Committing these would also fail outright -- GitHub rejects blobs over
+# 100 MB -- and a binary that large is unremovable from history without a
+# filter-repo and a force-push.
+vendor/ProPainter/weights/
+
 # Presets are deliberately NOT ignored -- wm-preset.json is the calibration
 # result and is worth committing once it is confirmed against real footage.
 

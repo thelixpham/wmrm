@@ -33,6 +33,12 @@ MUST_IGNORE = [
     "sample-boxcheck-zoom.png",
     ".busy-marked.a1b2c3.mp4",   # atomic-write temp
     "big-lama.pt",
+    # ProPainter's downloaded weights, 191 MB. Covered twice over: by *.pth and by
+    # the directory rule. The second entry is a file the extension rules do NOT
+    # match, so it fails if the directory rule is ever dropped and leaves only the
+    # extension rules standing.
+    "vendor/ProPainter/weights/ProPainter.pth",
+    "vendor/ProPainter/weights/README-from-upstream.txt",
 ]
 
 MUST_TRACK = [
@@ -45,6 +51,16 @@ MUST_TRACK = [
     "tests/score.py",
     # the calibration result is worth committing once confirmed
     "wm-preset.json",
+    # Vendored ProPainter is source now, not a nested checkout, so it has to be
+    # tracked -- an over-broad ignore rule here would silently produce a repo that
+    # cannot run --quality video at all.
+    "vendor/README.md",
+    "vendor/ProPainter/inference_propainter.py",
+    "vendor/ProPainter/wmrm_worker.py",
+    "vendor/ProPainter/model/propainter.py",
+    # Keeping this tracked is a license condition, not a preference: S-Lab 1.0
+    # clauses 1 and 2 require the notice to travel with the source.
+    "vendor/ProPainter/LICENSE",
 ]
 
 PARENT_MUST_IGNORE = [
@@ -96,8 +112,19 @@ def check(gitignore: Path, must_ignore: list[str], must_track: list[str], label:
 
 def main() -> int:
     bad = check(PROJECT / ".gitignore", MUST_IGNORE, MUST_TRACK, "wmrm/")
-    bad += check(PARENT / ".gitignore", PARENT_MUST_IGNORE, PARENT_MUST_TRACK,
-                 "remove-watermark/")
+
+    # The parent .gitignore belongs to the outer working directory that holds the
+    # reference repos and the source footage -- not to this project. A standalone
+    # clone of wmrm/ has no parent to check, and reporting that as a broken rule sent
+    # someone looking for a bug in their own checkout. Absent is a skip; present and
+    # wrong is still a failure.
+    parent_ignore = PARENT / ".gitignore"
+    if parent_ignore.exists():
+        bad += check(parent_ignore, PARENT_MUST_IGNORE, PARENT_MUST_TRACK,
+                     "remove-watermark/")
+    else:
+        print(f"\nskip  {parent_ignore} not present -- this is a standalone checkout, "
+              f"so there is no outer working directory to protect")
     print()
     if bad:
         print(f"{bad} rule(s) wrong")
