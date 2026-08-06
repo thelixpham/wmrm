@@ -122,7 +122,9 @@ class StubWorker:
 def run(src: Path, dst: Path, *, segment: int, overlap: int) -> StubWorker:
     stub = StubWorker()
     real = V._load_worker
-    V._load_worker = lambda opts: stub
+    # (worker, was_cached) -- _load_worker reports whether it had to load, so the run
+    # can say so. True here: a stub is always "already resident".
+    V._load_worker = lambda opts: (stub, True)
     try:
         V.run_propainter(
             src, dst,

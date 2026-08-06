@@ -112,8 +112,19 @@ def check(gitignore: Path, must_ignore: list[str], must_track: list[str], label:
 
 def main() -> int:
     bad = check(PROJECT / ".gitignore", MUST_IGNORE, MUST_TRACK, "wmrm/")
-    bad += check(PARENT / ".gitignore", PARENT_MUST_IGNORE, PARENT_MUST_TRACK,
-                 "remove-watermark/")
+
+    # The parent .gitignore belongs to the outer working directory that holds the
+    # reference repos and the source footage -- not to this project. A standalone
+    # clone of wmrm/ has no parent to check, and reporting that as a broken rule sent
+    # someone looking for a bug in their own checkout. Absent is a skip; present and
+    # wrong is still a failure.
+    parent_ignore = PARENT / ".gitignore"
+    if parent_ignore.exists():
+        bad += check(parent_ignore, PARENT_MUST_IGNORE, PARENT_MUST_TRACK,
+                     "remove-watermark/")
+    else:
+        print(f"\nskip  {parent_ignore} not present -- this is a standalone checkout, "
+              f"so there is no outer working directory to protect")
     print()
     if bad:
         print(f"{bad} rule(s) wrong")

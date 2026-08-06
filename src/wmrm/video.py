@@ -65,7 +65,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -110,7 +110,9 @@ def _sizeof(n: float) -> str:
 class ProPainterOpts:
     repo: Path
     device: str | None = None
-    segment: int = SEGMENT
+    # None means work it out from free VRAM, host RAM and the tile size. A number
+    # pins it, which is what you want when reproducing a run or bisecting an OOM.
+    segment: int | None = None
     overlap: int = OVERLAP
     subvideo_length: int = 80
     neighbor_length: int = 10
@@ -404,6 +406,152 @@ def _decode_frames(stream, tile):
         yield np.frombuffer(buf, np.uint8).reshape(tile.h, tile.w, 3).copy()
 
 
+def _hardware() -> dict:
+    """What this machine has. Everything optional, nothing raises.
+
+    No psutil: one more dependency for two numbers that /proc and torch already have,
+    and this has to keep working in a container whose installs were pinned months ago.
+    """
+    hw: dict = {"cpu": os.cpu_count() or 1, "ram_total": 0, "ram_avail": 0,
+                "gpu": None, "vram_total": 0, "vram_free": 0}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    hw["ram_total"] = int(line.split()[1]) * 1024
+                elif line.startswith("MemAvailable:"):
+                    hw["ram_avail"] = int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            i = torch.cuda.current_device()
+            hw["gpu"] = torch.cuda.get_device_name(i)
+            hw["vram_total"] = torch.cuda.get_device_properties(i).total_memory
+            try:
+                free, _ = torch.cuda.mem_get_info(i)
+                hw["vram_free"] = int(free)
+            except Exception:                     # noqa: BLE001 -- older torch
+                hw["vram_free"] = hw["vram_total"]
+    except ImportError:
+        pass
+    return hw
+
+
+# Bytes of device memory per tile pixel per frame, for a whole segment held at once.
+#
+# Calibrated from one measurement, which is the honest description of it: an A40 held a
+# 1827-frame segment of a 416x176 tile in 10 GiB, so 10*1024^3 / (1827*73216) = 80. It
+# covers the frames tensor, both flow fields, the completed flows and the propagated
+# frames.
+#
+# One data point is not a model. That is exactly why the OOM fallback in run_propainter
+# exists: this estimate is deliberately conservative, and when it is wrong anyway the
+# run degrades instead of dying.
+BYTES_PER_PIXEL_FRAME = 80
+
+# Fraction of free device memory to plan for. The rest absorbs allocator fragmentation
+# and anything else sharing the card.
+VRAM_BUDGET = 0.7
+# Same idea for host RAM, which holds the in-flight frame queues rather than tensors.
+RAM_BUDGET = 0.25
+
+
+def auto_segment(tile_area: int, hw: dict, overlap: int,
+                 ceiling: int = 2000) -> tuple[int, str]:
+    """Pick a segment length from the hardware. Returns (frames, why).
+
+    Two limits, and the reason for each:
+
+    - **Device memory.** The model materialises a whole segment as tensors before it
+      starts, so this is the limit that OOMs.
+    - **Host memory.** Decoded tile frames sit in two bounded queues either side of the
+      model, so peak host use is about 2 * (segment + 2*overlap) * tile bytes.
+
+    The ceiling is not a memory limit. Past a couple of thousand frames a longer segment
+    buys nothing -- inference is already chunked internally by --pp-subvideo -- while a
+    single failure costs more work to redo.
+    """
+    if not tile_area:
+        return ceiling, "no tile area to reason about"
+
+    # Only limits that were actually measured go in here. Defaulting an unmeasured
+    # limit to the ceiling and then attributing the result to it is how a CPU-only box
+    # ended up reporting "bound by VRAM".
+    limits: dict[str, int] = {f"the {ceiling}-frame ceiling": ceiling}
+    reasons = []
+
+    if hw.get("vram_free"):
+        by_vram = max(32, int(hw["vram_free"] * VRAM_BUDGET
+                              // (BYTES_PER_PIXEL_FRAME * tile_area)))
+        limits["VRAM"] = by_vram
+        reasons.append(f"{_sizeof(hw['vram_free'])} free VRAM -> {by_vram}")
+
+    avail = hw.get("ram_avail") or hw.get("ram_total") or 0
+    if avail:
+        per_frame = 2 * tile_area * 3          # two queues, bgr24
+        by_ram = max(32, int(avail * RAM_BUDGET // per_frame) - 2 * overlap)
+        limits["RAM"] = by_ram
+        reasons.append(f"{_sizeof(avail)} available RAM -> {by_ram}")
+
+    which = min(limits, key=lambda k: limits[k])
+    chosen = max(32, limits[which])
+    detail = f"{', '.join(reasons)}; " if reasons else ""
+    return chosen, f"{detail}bound by {which}"
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """Is this an out-of-memory failure, whatever torch version raised it?
+
+    Matched on the message as well as the type: torch.cuda.OutOfMemoryError only exists
+    from 1.13, and the CPU path raises a plain RuntimeError.
+    """
+    if exc.__class__.__name__ in ("OutOfMemoryError", "CudaOutOfMemoryError"):
+        return True
+    text = str(exc).lower()
+    return isinstance(exc, RuntimeError) and (
+        "out of memory" in text or "cuda oom" in text)
+
+
+def _inpaint_or_split(worker, block: list, mask, say, depth: int = 0):
+    """Repair a block, halving it if the device runs out of memory.
+
+    The automatic segment size is extrapolated from a single measurement on one card,
+    so it will sometimes be too big. Without this, being wrong means the run dies after
+    however long it had been going -- with it, being wrong costs one wasted attempt and
+    a smaller segment.
+
+    Splitting is not free and is not silent. The two halves each keep the other's
+    adjacent frames as context, so the join has two-sided context like any other
+    segment boundary, but their global reference frames are drawn from half the range,
+    which is a small quality cost. It is logged every time so a run that is quietly
+    doing this all the way through is visible as such -- the fix for that is a smaller
+    --pp-segment, not this fallback.
+    """
+    import numpy as np                       # local: keeps the module import light
+
+    try:
+        return worker.inpaint(np.stack(block), mask)
+    except BaseException as exc:             # noqa: BLE001 -- re-raised unless OOM
+        if not _is_oom(exc) or len(block) < 32 or depth >= 3:
+            raise
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        half = len(block) // 2
+        ctx = min(16, half)
+        say(f"[pp]   out of memory on {len(block)} frames -- retrying as "
+            f"{half} + {len(block) - half} with {ctx} frames of context across the "
+            f"join. Set --pp-segment lower to avoid the wasted attempt.")
+        first = _inpaint_or_split(worker, block[:half + ctx], mask, say, depth + 1)
+        second = _inpaint_or_split(worker, block[half - ctx:], mask, say, depth + 1)
+        # Drop each half's context so the result lines up with `block` one for one.
+        return np.concatenate([first[:half], second[ctx:]])
+
+
 def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float) -> list[int]:
     """Frame indices where a new shot begins, via ffmpeg's scene score.
 
@@ -488,6 +636,20 @@ def run_propainter(
                           feather_px=feather_px, margin_px=margin_px)
     tile = region.tile
     say = (lambda m: print(m, file=sys.stderr, flush=True)) if progress else (lambda m: None)
+
+    hw = _hardware()
+    if opts.segment is None:
+        segment, why = auto_segment(tile.w * tile.h, hw, opts.overlap)
+        say(f"[pp] hardware: {hw['cpu']} cpu, {_sizeof(hw['ram_total'])} RAM"
+            + (f", {hw['gpu']} {_sizeof(hw['vram_total'])}" if hw["gpu"] else ", no GPU"))
+        say(f"[pp] segment {segment} frames, chosen automatically ({why}). "
+            f"Pin it with --pp-segment.")
+    else:
+        segment = opts.segment
+        say(f"[pp] segment {segment} frames (pinned via --pp-segment)")
+    # Everything below reads opts.segment, so resolve it once rather than threading a
+    # second variable through the plan and the tail loop.
+    opts = replace(opts, segment=segment)
 
     if opts.workers > 1:
         say(f"[pp] note: --pp-workers {opts.workers} is ignored. One resident model "
@@ -642,7 +804,7 @@ def run_propainter(
                     + (f", {n}/{est_total} decoded" if est_total else ""))
 
                 ts = time.monotonic()
-                out = worker.inpaint(np.stack(block), region.inpaint_mask)
+                out = _inpaint_or_split(worker, block, region.inpaint_mask, say)
                 t_model += time.monotonic() - ts
                 model_frames += len(block)
 
@@ -716,8 +878,8 @@ def run_propainter(
                     f"{body_len} frames -- the source reported {est_total} frames but "
                     f"has more, so these are cut on size, not on shots")
                 ts = time.monotonic()
-                out = worker.inpaint(np.stack(left + body + ahead),
-                                     region.inpaint_mask)
+                out = _inpaint_or_split(worker, left + body + ahead,
+                                        region.inpaint_mask, say)
                 t_model += time.monotonic() - ts
                 model_frames += len(left) + body_len + ahead_len
                 for i in range(len(left), len(left) + body_len):

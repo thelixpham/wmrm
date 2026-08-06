@@ -34,6 +34,24 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
     """Return the box to use plus the knobs, from --box, --preset or --detect."""
     if args.box and args.preset:
         raise SystemExit("error: pass either --box or --preset, not both")
+    # No box, no preset -> detect. This used to be an error telling you to pass one of
+    # three flags, which is the right default only if an accidental unattended guess is
+    # the worst outcome. It no longer is: a detected box is now checked by the coverage
+    # test before anything is processed, a preview is always written, and a file whose
+    # box is provably too small is stopped rather than shipped. With those in place,
+    # refusing to do the obvious thing was just a flag to memorise.
+    #
+    # A named --preset or --box still wins, and still skips detection entirely.
+    if not args.box and not args.preset and not getattr(args, "detect", False):
+        if src is None:
+            raise SystemExit(
+                "error: need --box x,y,w,h or --preset wm.json here (this command "
+                "cannot detect, it has no video to look at)"
+            )
+        args.detect = True
+        print("[wmrm] no --box or --preset given, so detecting the watermark",
+              file=sys.stderr)
+
     if args.box:
         box = Box.parse(args.box).clamp(width, height)
         preset = Preset.from_box(box, width, height)
@@ -62,13 +80,8 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
             )
         preset = Preset.load(path).scaled_px(width, height)
         box = preset.box_for(width, height)
-    else:
-        raise SystemExit(
-            "error: need one of --preset wm.json, --box x,y,w,h, or --detect\n"
-            "  --detect          find the watermark and process in one go\n"
-            "  --box x,y,w,h     coordinates you measured (see 'wmrm grid')\n"
-            "  --preset wm.json  saved coordinates (see 'wmrm detect')"
-        )
+    else:                                    # pragma: no cover -- unreachable now
+        raise SystemExit("error: could not work out which box to use")
 
     overrides = {
         f"{name}_px": getattr(args, name)
@@ -340,9 +353,18 @@ def cmd_batch(args) -> int:
     if not videos:
         raise SystemExit(f"error: no videos in {root} (looked for {', '.join(VIDEO_SUFFIXES)})")
 
+    outbox = Path(args.outbox) if getattr(args, "outbox", None) else None
+    if outbox is not None:
+        outbox.mkdir(parents=True, exist_ok=True)
+
+    def destination(src: Path) -> Path:
+        if outbox is None:
+            return _default_output(src)
+        return outbox / f"{src.stem}{CLEAN_SUFFIX}{src.suffix or '.mp4'}"
+
     todo = []
     for src in videos:
-        dst = _default_output(src)
+        dst = destination(src)
         if dst.exists() and not args.force:
             print(f"[wmrm] skip (exists): {dst.name}", file=sys.stderr)
             continue
@@ -353,12 +375,32 @@ def cmd_batch(args) -> int:
 
     print(f"[wmrm] {len(todo)} video(s) to process", file=sys.stderr)
 
-    # With --detect, detect ONCE on the first video and reuse it for the whole
-    # folder. Detecting per file is what makes unattended batch dangerous: every
-    # file gets a different box, so one bad guess corrupts one file and you have
-    # no single thing to eyeball. One box, one preview, one decision.
+    # Two ways to get a box, and the choice is about what the batch is.
+    #
+    # --detect (one box for the folder): repeatable, and there is one preview and one
+    # decision for a human to make. Right when every file is the same watermark from
+    # the same pipeline.
+    #
+    # --detect-each (a box per file): a better fit when the batch is mixed, since a box
+    # measured on one source says nothing about a different crop, logo or placement and
+    # normalized coordinates only rescue a change of resolution. What it costs is the
+    # single place someone confirmed the box, which is why the coverage gate below is on
+    # by default for it.
+    # Per file is the default here, not --detect-each. A folder is the case where the
+    # files are most likely to differ from each other, so reusing one file's box across
+    # all of them is the assumption that needs asking for, and --detect is how you ask.
+    detect_each = (not args.box and not args.preset
+                   and not getattr(args, "detect", False)) or bool(
+                       getattr(args, "detect_each", False))
+    detect_each = detect_each and not args.box and not args.preset
+    if detect_each:
+        args.detect = True          # _resolve_region reads this per file
+        print("[wmrm] detecting a box per video (--detect uses one box for the folder)",
+              file=sys.stderr)
+
     shared: Preset | None = None
-    if getattr(args, "detect", False) and not args.box and not args.preset:
+    if (not detect_each and getattr(args, "detect", False)
+            and not args.box and not args.preset):
         first = todo[0][0]
         print(f"[wmrm] detecting on {first.name}, then applying to all "
               f"{len(todo)} files", file=sys.stderr)
@@ -373,9 +415,18 @@ def cmd_batch(args) -> int:
     else:
         first_box, first_preset = _resolve_region(
             args, first_info.width, first_info.height, src=first_src)
-    # One fitted map for the folder, same reasoning as one box for the folder.
-    backend = _make_backend(args, src=first_src, box=first_box, preset=first_preset)
-    failures = []
+    # One fitted map for the folder, same reasoning as one box for the folder. With a
+    # box per file that reasoning no longer holds: an un-blend map fitted on the first
+    # file's box would be applied through a different box on the next one, so it is
+    # refitted per file below instead.
+    backend = None if detect_each else _make_backend(
+        args, src=first_src, box=first_box, preset=first_preset)
+
+    gate = detect_each and not getattr(args, "no_coverage_gate", False)
+    failures: list[str] = []
+    blocked: list[str] = []
+    unverified: list[str] = []
+
     for i, (src, dst) in enumerate(todo, 1):
         print(f"\n[wmrm] ({i}/{len(todo)}) {src.name}", file=sys.stderr)
         try:
@@ -387,17 +438,51 @@ def cmd_batch(args) -> int:
                 box = preset.box_for(info.width, info.height)
             else:
                 box, preset = _resolve_region(args, info.width, info.height, src=src)
-            _log_config(src, dst, info, box, preset, args, backend)
-            _process_one(src, dst, box, preset, args, backend)
+
+            if gate:
+                from .coverage import check_coverage
+                cov = check_coverage(src, box)
+                print(cov.describe(), file=sys.stderr)
+                if cov.inconclusive:
+                    # The background is static, so no statistic separates mark from
+                    # wall. Not a reason to refuse the work -- a reason to say so and
+                    # list it again at the end.
+                    print(f"[wmrm] {src.name}: coverage INCONCLUSIVE -- processing, "
+                          f"confirm this one by eye", file=sys.stderr)
+                    unverified.append(src.name)
+                elif not cov.ok:
+                    s = cov.suggested
+                    hint = (f" Try --box {s.x},{s.y},{s.w},{s.h}" if s else "")
+                    print(f"[wmrm] SKIPPED {src.name}: the detected box is too small, "
+                          f"the watermark extends outside it.{hint}", file=sys.stderr)
+                    blocked.append(src.name)
+                    continue
+
+            per_file_backend = backend
+            if detect_each:
+                per_file_backend = _make_backend(args, src=src, box=box, preset=preset)
+            _log_config(src, dst, info, box, preset, args, per_file_backend)
+            _process_one(src, dst, box, preset, args, per_file_backend)
         except (EncodeError, ProbeError, DetectError) as exc:
             print(f"[wmrm] FAILED {src.name}: {exc}", file=sys.stderr)
             failures.append(src.name)
 
+    # Repeated at the end because nobody scrolls back through fifty files of log, and
+    # a blocked file that is not shouted about reads as a file that was fine.
+    if blocked:
+        print(f"\n[wmrm] NOT PROCESSED -- detected box too small ({len(blocked)}): "
+              f"{', '.join(blocked)}", file=sys.stderr)
+        print("[wmrm]   measure each by hand: wmrm grid FILE --corner tr", file=sys.stderr)
+    if unverified:
+        print(f"\n[wmrm] PROCESSED BUT UNVERIFIED -- coverage could not answer "
+              f"({len(unverified)}): {', '.join(unverified)}", file=sys.stderr)
+        print("[wmrm]   static background there; check these by eye", file=sys.stderr)
     if failures:
         print(f"\n[wmrm] {len(failures)} failed: {', '.join(failures)}", file=sys.stderr)
-        return 1
-    print(f"\n[wmrm] all {len(todo)} done", file=sys.stderr)
-    return 0
+    done = len(todo) - len(failures) - len(blocked)
+    print(f"\n[wmrm] {done} processed, {len(blocked)} blocked, {len(failures)} failed",
+          file=sys.stderr)
+    return 1 if (failures or blocked) else 0
 
 
 def cmd_grid(args) -> int:
@@ -541,10 +626,12 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--propainter", default=None,
                    help="path to the ProPainter checkout (else $PROPAINTER_HOME, "
                         "else a sibling directory of this project)")
-    p.add_argument("--pp-segment", type=int, default=400,
-                   help="MAXIMUM frames per ProPainter invocation (default 400). It "
-                        "loads a whole segment into memory, so lower this if you run "
-                        "out. Segments also stop at scene cuts, so most are shorter")
+    p.add_argument("--pp-segment", type=int, default=None,
+                   help="MAXIMUM frames per ProPainter invocation. Default: worked out "
+                        "from free VRAM, available RAM and the tile size, and printed "
+                        "with its reasoning. Segments also stop at scene cuts, so most "
+                        "are shorter. Pin a number to reproduce a run or to bisect an "
+                        "out-of-memory failure")
     p.add_argument("--pp-scene-threshold", type=float, default=0.3,
                    help="ffmpeg scene score above which a frame starts a new shot "
                         "(default 0.3). Segments never span a cut, because the model "
@@ -649,6 +736,19 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("directory")
     b.add_argument("--force", action="store_true", help="reprocess even if output exists")
     b.add_argument("--no-verify", action="store_true")
+    b.add_argument("--outbox", default=None,
+                   help="write results here instead of next to each input")
+    b.add_argument("--detect-each", action="store_true",
+                   help="detect a box per video instead of once for the folder. Right "
+                        "when the batch is mixed -- a box measured on one source says "
+                        "nothing about a different crop, logo or placement. It costs "
+                        "the one place a human confirmed the box, so every detected "
+                        "box is checked with the coverage test before anything is "
+                        "processed")
+    b.add_argument("--no-coverage-gate", action="store_true",
+                   help="process even when the coverage check says the detected box is "
+                        "too small. Not a speed lever: it turns a stopped file into a "
+                        "silently bad one")
     _add_region_args(b)
     _add_run_args(b)
     b.set_defaults(func=cmd_batch, preview_only=False)

@@ -151,17 +151,17 @@ if [[ "$PRESET_GIVEN" == "1" ]]; then
   # file exists yet. Existing: use it. Missing: calibrate once and write it there,
   # which is the only reading of `PRESET=x.json` that makes sense on a first run.
   if [[ -f "$PRESET" ]]; then
-    log "using the box you named: $PRESET"
+    log "using saved box from $PRESET"
   else
-    log "no $PRESET yet -- detecting on $(basename "${videos[0]}") and saving it there"
+    log "no preset yet -- detecting on $(basename "${videos[0]}"), saving to $PRESET"
     "${WMRM[@]}" detect "${videos[0]}" --corner "$CORNER" --preset "$PRESET"
   fi
   shared_preset="$PRESET"
 elif [[ "$DETECT" == "once" ]]; then
   if [[ -f "$PRESET" ]]; then
-    log "using the saved box in $(basename "$PRESET") for all ${#videos[@]} file(s)"
+    log "using saved box from $(basename "$PRESET") for all ${#videos[@]} file(s)"
   else
-    log "DETECT=once -- detecting on $(basename "${videos[0]}"), reusing for all"
+    log "no preset yet -- DETECT=once, detecting on $(basename "${videos[0]}")"
     "${WMRM[@]}" detect "${videos[0]}" --corner "$CORNER" --preset "$PRESET"
   fi
   shared_preset="$PRESET"
@@ -209,8 +209,11 @@ clean_up() {   # <src> <preset> <base>
 # Per-file presets are kept for the files that need a second look. They are the record
 # of what box each output was actually made with, which is the first thing anyone asks
 # when one output looks wrong.
+#
+# Created on first use, not up front: when one shared box is in play this directory
+# would stay empty, and an empty dot-directory appearing in outbox/ is a surprise for
+# anything that lists that folder expecting only results.
 presetdir="$OUTBOX/.presets"
-mkdir -p "$presetdir"
 
 # --- process ------------------------------------------------------------------ #
 processed=0 skipped=0 failed=0 failed_names=()
@@ -232,6 +235,7 @@ for src in "${videos[@]}"; do
   if [[ -n "$shared_preset" ]]; then
     preset="$shared_preset"
   else
+    mkdir -p "$presetdir"
     preset="$presetdir/${base%.*}.json"
     if ! "${WMRM[@]}" detect "$src" --corner "$CORNER" --preset "$preset"; then
       warn "FAILED (detect found nothing): $base"
