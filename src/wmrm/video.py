@@ -669,6 +669,9 @@ def run_propainter(
 
     t0 = time.monotonic()
     shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps))
+    _plan_est_total = info.nframes or (1 << 30)
+    plan = _segment_plan(shot_starts, _plan_est_total, opts.segment, opts.overlap,
+                         opts.min_shot)
     t_cuts = time.monotonic() - t0
     if opts.scene_threshold > 0:
         say(f"[pp] scene detection: {len(shot_starts)} cut(s) found in {_hms(t_cuts)} "
@@ -697,7 +700,13 @@ def run_propainter(
 
         # Bounded queues are the backpressure. One segment of lookahead on each side
         # is enough to keep every stage busy; more would only raise peak memory.
-        depth = opts.segment + 2 * opts.overlap
+        # Sized from the largest segment the plan actually contains, not from
+        # --pp-segment. Those are the same number only when no scene cut shortens
+        # anything; with cuts they are far apart, and sizing on the ceiling cost 855 MB
+        # of queues to carry segments of at most 232 frames. The queues are the
+        # backpressure, so they need to hold one segment plus its context and no more.
+        longest = max((e - s for s, e, _, _ in plan), default=opts.segment)
+        depth = queue_depth = longest + 2 * opts.overlap
         q_in: queue.Queue = queue.Queue(maxsize=depth)
         q_out: queue.Queue = queue.Queue(maxsize=depth)
         DONE = object()
@@ -762,8 +771,6 @@ def run_propainter(
         est_total = info.nframes or 0
         broken = False
 
-        plan = _segment_plan(shot_starts, est_total or 1 << 30, opts.segment,
-                             opts.overlap, opts.min_shot)
         if shot_starts:
             lens = [e - s for s, e, _, _ in plan]
             say(f"[pp] {len(shot_starts)} scene cut(s) -> {len(plan)} segment(s), "
@@ -960,7 +967,7 @@ def run_propainter(
     say(f"[pp] TOTAL {_hms(total)} for {n} frames "
         f"({n / max(total, 1e-6):.2f} fps, "
         f"{total / max(info.duration, 1e-6):.1f}x realtime)  "
-        f"peak in-flight {_sizeof(2 * (opts.segment + 2 * opts.overlap) * tile.w * tile.h * 3)}"
+        f"peak in-flight {_sizeof(2 * queue_depth * tile.w * tile.h * 3)}"
         f" of frames, flat in video length")
     # Extrapolate, because a one-minute test says nothing about the videos this is
     # actually for until it is scaled up.
