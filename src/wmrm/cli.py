@@ -151,6 +151,7 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
             progress=not args.quiet,
             opts=ProPainterOpts(repo=find_repo(args.propainter),
                                 segment=args.pp_segment,
+                                subvideo_length=args.pp_subvideo,
                                 raft_iter=args.raft_iter,
                                 fp16=not args.no_fp16,
                                 workers=args.pp_workers),
@@ -514,6 +515,12 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pp-segment", type=int, default=400,
                    help="frames per ProPainter invocation (default 400). It loads a "
                         "whole segment into memory, so lower this if you run out")
+    p.add_argument("--pp-subvideo", type=int, default=80,
+                   help="frames per inference chunk inside one segment (default 80). "
+                        "This, not --pp-segment, is what caps VRAM during inference: "
+                        "measured on an A40, a 1827-frame segment held only 10 GiB of "
+                        "45 because the model still worked 80 frames at a time. "
+                        "Raising it trades VRAM for fewer chunk boundaries")
     p.add_argument("--pp-workers", type=int, default=1,
                    help="segments to run concurrently (default 1). Output is "
                         "identical either way, so this is purely a speed knob. How "

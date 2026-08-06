@@ -81,6 +81,18 @@ def _hms(seconds: float) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
+def _dir_bytes(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def _sizeof(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
 @dataclass
 class ProPainterOpts:
     repo: Path
@@ -207,13 +219,17 @@ def run_propainter(
     tile = region.tile
     say = (lambda m: print(m, file=sys.stderr, flush=True)) if progress else (lambda m: None)
 
+    t_start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="wmrm-pp-") as td:
         work = Path(td)
         raw = work / "tile"
+        t0 = time.monotonic()
         n = _extract_tile(ffmpeg, src, tile, raw)
+        t_extract = time.monotonic() - t0
         if n == 0:
             raise ProPainterError("no frames were extracted from the tile")
-        say(f"[pp] extracted {n} tile frames ({tile.w}x{tile.h})")
+        say(f"[pp] extracted {n} tile frames ({tile.w}x{tile.h}) "
+            f"in {_hms(t_extract)}, {_sizeof(_dir_bytes(raw))} on disk")
 
         # Same binary mask the model paths use, so every engine is asked to remove
         # exactly the same pixels.
@@ -259,7 +275,7 @@ def run_propainter(
 
         workers = max(1, min(opts.workers, len(plan)))
         say(f"[pp] {n_seg} segment(s) of {step} frames, {workers} at a time")
-        t0 = time.monotonic()
+        t_model0 = time.monotonic()
         done_frames = 0
 
         if workers == 1:
@@ -271,7 +287,7 @@ def run_propainter(
                 done_frames += collect(item, _run_segment(opts, seg_in, mask_png,
                                                           out_dir))
                 say(f"[pp]   {_hms(time.monotonic() - ts)}  "
-                    f"{done_frames / (time.monotonic() - t0):.2f} fps avg")
+                    f"{done_frames / (time.monotonic() - t_model0):.2f} fps avg")
         else:
             # Threads, not processes: every task blocks in subprocess.run, which
             # releases the GIL for the whole of the work that matters.
@@ -289,7 +305,8 @@ def run_propainter(
             def launch(item):
                 si, seg_in, out_dir, start, end, lo, hi = item
                 say(f"[pp] segment {si + 1}/{n_seg} start: frames {start}-{end - 1} "
-                    f"(+{start - lo}/{hi - end} context) at {_hms(time.monotonic() - t0)}")
+                    f"(+{start - lo}/{hi - end} context) "
+                    f"at {_hms(time.monotonic() - t_model0)}")
                 return _run_segment(opts, seg_in, mask_png, out_dir)
 
             with cf.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -297,13 +314,23 @@ def run_propainter(
                 for fut in cf.as_completed(futs):
                     item = futs[fut]
                     done_frames += collect(item, fut.result())
-                    el = time.monotonic() - t0
+                    el = time.monotonic() - t_model0
                     say(f"[pp] segment {item[0] + 1}/{n_seg} done  "
                         f"({done_frames}/{n} frames, {_hms(el)}, "
                         f"{done_frames / el:.2f} fps avg)")
 
-        say(f"[pp] {n} frames repaired in {_hms(time.monotonic() - t0)} "
-            f"({n / max(time.monotonic() - t0, 1e-6):.2f} fps, {workers} worker(s))")
+        t_model = time.monotonic() - t_model0
+        # Frames the model actually ran on, not frames kept. Context frames at the
+        # segment joins are computed and then thrown away, so `kept / t_model`
+        # flatters the model on a many-segment run and makes two configurations with
+        # different segment counts look faster or slower than they are.
+        model_frames = sum(hi - lo for _, _, _, _, _, lo, hi in plan)
+        waste = model_frames - n
+        say(f"[pp] {n} frames repaired in {_hms(t_model)} "
+            f"({n / max(t_model, 1e-6):.2f} fps, {workers} worker(s))"
+            + (f"  |  {model_frames} frames computed, {waste} discarded as segment "
+               f"context ({100 * waste / model_frames:.1f}% wasted)" if waste else
+               "  |  no context discarded"))
 
         done = sorted(clean.glob("*.png"))
         if len(done) != n:
@@ -315,7 +342,8 @@ def run_propainter(
                 f"cleaned tile is {got}, expected {tile.w}x{tile.h}. "
                 "This is the macro_block_size resize -- the PNG frames should be "
                 "exact, so something read the mp4 instead.")
-        say(f"[pp] {n} frames repaired; compositing")
+        say("[pp] compositing")
+        t_comp0 = time.monotonic()
 
         alpha_png = work / "alpha.png"
         cv2.imwrite(str(alpha_png), (region.alpha[:, :, 0] * 255).astype(np.uint8))
@@ -352,10 +380,32 @@ def run_propainter(
             cmd += ["-movflags", "+faststart"]
         cmd.append(str(tmp))
 
+        peak_bytes = _dir_bytes(work)
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             tmp.unlink(missing_ok=True)
             raise EncodeError(f"compositing failed:\n{res.stderr[-2000:]}")
+        t_composite = time.monotonic() - t_comp0
         os.replace(tmp, dst)
 
+    total = time.monotonic() - t_start
+    # The breakdown is the point, not the total. Only `model` responds to the
+    # ProPainter settings or to a faster card; extract and composite are ffmpeg on
+    # the CPU and will not move no matter what is tuned here. Printing the split
+    # stops effort going into the 82% that is already the model, or into the model
+    # when it turns out ffmpeg is what costs.
+    pct = lambda x: 100 * x / max(total, 1e-6)          # noqa: E731
+    say(f"[pp] TIME  extract {_hms(t_extract)} ({pct(t_extract):.0f}%)  "
+        f"model {_hms(t_model)} ({pct(t_model):.0f}%)  "
+        f"composite {_hms(t_composite)} ({pct(t_composite):.0f}%)")
+    say(f"[pp] TOTAL {_hms(total)} for {n} frames "
+        f"({n / max(total, 1e-6):.2f} fps, "
+        f"{total / max(info.duration, 1e-6):.1f}x realtime)  "
+        f"peak temp disk {_sizeof(peak_bytes)}")
+    # Extrapolate, because a one-minute test says nothing about the videos this is
+    # actually for until it is scaled up.
+    say(f"[pp] EXTRAPOLATED  1 hour of this footage -> "
+        f"~{_hms(3600.0 * total / max(info.duration, 1e-6))}, "
+        f"~{_sizeof(peak_bytes * 3600.0 / max(info.duration, 1e-6))} temp disk "
+        f"at --pp-segment {opts.segment}")
     return region
