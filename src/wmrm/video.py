@@ -118,6 +118,14 @@ class ProPainterOpts:
     raft_iter: int = 20
     mask_dilation: int = 4
     fp16: bool = True
+    # ffmpeg scene score above which a frame starts a new shot. 0 disables cut
+    # detection and falls back to cutting every `segment` frames regardless of
+    # content, which is what produced the wrong-shot fill described in _segment_plan.
+    scene_threshold: float = 0.3
+    # Shots shorter than this are merged with the previous one rather than handed to
+    # the model alone. ProPainter needs frames to propagate from; a 4-frame segment
+    # has none.
+    min_shot: int = 16
     # Accepted and ignored, kept so existing command lines and presets do not break.
     #
     # It used to mean "this many segments in flight", which was worth having when each
@@ -189,6 +197,29 @@ def describe_device() -> str:
     return f"cpu ({why}) -- expect minutes per hundred frames"
 
 
+def _lands_on_cpu(device: str | None) -> bool:
+    """Would this device selection end up on the CPU?
+
+    Answered before the models load, because loading them takes ~40s and the answer
+    decides whether to load them at all.
+    """
+    try:
+        import torch
+    except ImportError:
+        return True
+    if device is None:                       # ProPainter's own rule
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return False
+        return not (torch.cuda.is_available() and torch.backends.cudnn.is_available())
+    if device.startswith("cuda"):
+        return not torch.cuda.is_available()
+    if device.startswith("mps"):
+        mps = getattr(torch.backends, "mps", None)
+        return not (mps is not None and mps.is_available())
+    return True
+
+
 def _load_worker(opts: ProPainterOpts):
     """Import the resident worker out of the checkout and construct it.
 
@@ -217,6 +248,29 @@ def _load_worker(opts: ProPainterOpts):
     # 'auto' is the CLI's word for "use ProPainter's own rule", which is what the
     # worker does when handed None.
     device = None if opts.device in (None, "", "auto") else opts.device
+
+    # This engine is the default, so a CPU fallback has to be loud. Measured at 0.27
+    # fps on six cores -- roughly 1.8 hours per minute of 1080p, ~400x the un-blend
+    # path. That is not a slower run, it is a run nobody waits for, and silently
+    # starting one is worse than refusing. Naming --device cpu overrides this: then it
+    # is a decision rather than an accident.
+    if device != "cpu" and _lands_on_cpu(device):
+        raise ProPainterError(
+            "--quality video would run on the CPU, and that is ~0.27 fps: about 1.8 "
+            "hours for one minute of 1080p.\n"
+            f"  device asked for : {opts.device or 'auto'}\n"
+            f"  what is available: {describe_device()}\n"
+            "Either use the engine that is built for the CPU, which on a "
+            "semi-transparent mark is also the least destructive one here:\n"
+            "  --quality unblend            (34 fps at 1080p, cannot flicker)\n"
+            "or say you mean it:\n"
+            "  --quality video --device cpu\n"
+            "If this box does have a card, torch cannot see it -- most often the "
+            "CPU-only wheel. Check with:\n"
+            "  python -c \"import torch; print(torch.__version__, "
+            "torch.cuda.is_available())\""
+        )
+
     return ProPainterWorker(device=device, opts=WorkerOpts(
         subvideo_length=opts.subvideo_length,
         neighbor_length=opts.neighbor_length,
@@ -312,6 +366,68 @@ def _decode_frames(stream, tile):
         yield np.frombuffer(buf, np.uint8).reshape(tile.h, tile.w, 3).copy()
 
 
+def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float) -> list[int]:
+    """Frame indices where a new shot begins, via ffmpeg's scene score.
+
+    One extra decode of the video, which is affordable here only because decoding is a
+    small slice of this engine's cost: measured 7% against 77% for the model. It is not
+    affordable at all in the un-blend path, which is why this lives here.
+    """
+    if threshold <= 0:
+        return []
+    res = subprocess.run(
+        [ffmpeg, "-v", "error", "-nostdin", "-i", str(src),
+         "-vf", f"select='gt(scene,{threshold})',metadata=print:file=-",
+         "-an", "-f", "null", "-"],
+        capture_output=True, text=True)
+    out = set()
+    for line in (res.stdout + res.stderr).splitlines():
+        if "pts_time:" in line:
+            try:
+                out.add(int(round(float(line.split("pts_time:")[1].split()[0]) * fps)))
+            except (IndexError, ValueError):
+                continue
+    return sorted(out)
+
+
+def _segment_plan(shot_starts: list[int], total: int, segment: int,
+                  overlap: int, min_shot: int) -> list[tuple[int, int, int, int]]:
+    """Body ranges plus how much context each may take, as (start, end, left, right).
+
+    Segments stop at shot boundaries. This is the fix for a measured defect: a 30-frame
+    shot inside a 440-frame segment had almost every one of its global reference frames
+    land in a different scene, and the optical flow across the cut bounding it is
+    meaningless, so the model filled the watermark region with content from the wrong
+    shot for the whole of that shot. Confining a segment to one shot makes every
+    reference and every flow vector same-shot by construction.
+
+    Context is clipped at the shot too, for the same reason: 20 frames of "context"
+    from the previous scene is worse than none.
+
+    Shots shorter than `min_shot` are merged forwards instead of being handed over
+    alone, because below roughly a dozen frames the model has nothing to propagate
+    from and would produce a worse result than a slightly impure segment. That merge
+    is a compromise and it is logged rather than hidden.
+    """
+    bounds = [0]
+    for s in shot_starts:
+        if 0 < s < total and s - bounds[-1] >= min_shot:
+            bounds.append(s)
+    if bounds[-1] != total:
+        # A trailing shot shorter than min_shot is absorbed by the one before it.
+        if total - bounds[-1] < min_shot and len(bounds) > 1:
+            bounds[-1] = total
+        else:
+            bounds.append(total)
+
+    plan = []
+    for a, b in zip(bounds, bounds[1:]):
+        for s in range(a, b, segment):
+            e = min(b, s + segment)
+            plan.append((s, e, min(overlap, s - a), min(overlap, b - e)))
+    return plan
+
+
 def run_propainter(
     src: Path,
     dst: Path,
@@ -346,6 +462,13 @@ def run_propainter(
     t_load = time.monotonic() - t0
     say(f"[pp] models loaded in {_hms(t_load)} (once for the whole video, not once "
         f"per segment)")
+
+    t0 = time.monotonic()
+    shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps))
+    t_cuts = time.monotonic() - t0
+    if opts.scene_threshold > 0:
+        say(f"[pp] scene detection: {len(shot_starts)} cut(s) found in {_hms(t_cuts)} "
+            f"(threshold {opts.scene_threshold})")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="wmrm-pp-") as td:
@@ -424,43 +547,55 @@ def run_propainter(
 
         n = 0                  # frames read
         emitted = 0            # frames handed to the compositor
+        nonfinite_total = 0
+        nonfinite_at: set[int] = set()
         model_frames = 0       # frames the model actually ran on, context included
         n_seg = 0
         eof = False
-        left: list[np.ndarray] = []      # already-emitted frames kept as left context
-        pending: list[np.ndarray] = []   # decoded, not yet emitted
+        hist: list[np.ndarray] = []      # last `overlap` emitted frames, for left context
+        buf: list[np.ndarray] = []       # decoded, not yet emitted; buf[0] is frame `emitted`
         t_model = 0.0
         est_total = info.nframes or 0
         broken = False
 
+        plan = _segment_plan(shot_starts, est_total or 1 << 30, opts.segment,
+                             opts.overlap, opts.min_shot)
+        if shot_starts:
+            lens = [e - s for s, e, _, _ in plan]
+            say(f"[pp] {len(shot_starts)} scene cut(s) -> {len(plan)} segment(s), "
+                f"{min(lens)}-{max(lens)} frames each; no segment spans a cut")
+        else:
+            say(f"[pp] no scene cuts found -> {len(plan)} fixed segment(s) of "
+                f"{opts.segment}")
+
         try:
-            while True:
-                # Fill the body of this segment.
-                while not eof and len(pending) < opts.segment:
+            for seg_i, (s_abs, e_abs, lcap, rcap) in enumerate(plan):
+                if eof and not buf:
+                    break
+                # Frames still needed: this body, plus its right-hand context. Those
+                # context frames are the next segment's body, so they stay in `buf`.
+                want = (e_abs - s_abs) + rcap
+                while not eof and len(buf) < want:
                     f = next_frame()
                     if f is None:
                         eof = True
                         break
-                    pending.append(f)
+                    buf.append(f)
                     n += 1
-                if not pending:
+                if not buf:
                     break
 
-                body = pending
-                # Read the right-hand context. These frames belong to the next
-                # segment's body too -- they are context here and kept there.
-                ahead: list[np.ndarray] = []
-                while not eof and len(ahead) < opts.overlap:
-                    f = next_frame()
-                    if f is None:
-                        eof = True
-                        break
-                    ahead.append(f)
-                    n += 1
+                # min(): the plan is built from probe's frame count, which can be an
+                # estimate. A short final segment is normal, not an error.
+                body_len = min(e_abs - s_abs, len(buf))
+                ahead_len = min(rcap, len(buf) - body_len)
+                left = hist[-lcap:] if lcap else []
+                body = buf[:body_len]
+                ahead = buf[body_len:body_len + ahead_len]
 
                 block = left + body + ahead
                 n_seg += 1
-                say(f"[pp] segment {n_seg}: {len(body)} frames "
+                say(f"[pp] segment {n_seg}/{len(plan)}: frames {s_abs}-{s_abs + body_len - 1} "
                     f"(+{len(left)}/{len(ahead)} context)"
                     + (f", {n}/{est_total} decoded" if est_total else ""))
 
@@ -468,6 +603,23 @@ def run_propainter(
                 out = worker.inpaint(np.stack(block), region.inpaint_mask)
                 t_model += time.monotonic() - ts
                 model_frames += len(block)
+
+                # The model diverging is not a crash and does not change the frame
+                # count, so without this it reaches the output as a wrong-coloured
+                # patch in a run whose own checks all pass.
+                bad = getattr(worker, "nonfinite", 0)
+                if bad:
+                    frames_hit = sorted(getattr(worker, "nonfinite_frames", ()))
+                    # `emitted` is the absolute index of body[0]: it counts frames
+                    # already sent, and body[0] is the next one to send. Block index i
+                    # therefore sits at emitted - len(left) + i.
+                    absolute = [emitted - len(left) + i for i in frames_hit]
+                    nonfinite_total += bad
+                    nonfinite_at.update(absolute)
+                    say(f"[pp]   WARNING the model produced {bad} non-finite value(s) "
+                        f"in this segment, affecting frames "
+                        f"{absolute[:6]}{'...' if len(absolute) > 6 else ''}. Those "
+                        f"pixels are arbitrary bytes. Try --no-fp16.")
 
                 if out.shape[0] != len(block):
                     raise ProPainterError(
@@ -491,10 +643,47 @@ def run_propainter(
                     f"{rate:.2f} fps model" + (f"  eta {_hms(eta)}" if eta else "")
                     + f"  elapsed {_hms(el)}")
 
-                left = body[-opts.overlap:] if opts.overlap else []
-                pending = ahead
-                if eof and not pending:
+                # Keep the tail of what was just emitted as the next segment's left
+                # context. `lcap` on the next segment is what stops it reaching back
+                # across a cut, so nothing here needs to know where the shots are.
+                if opts.overlap:
+                    hist = (hist + body)[-opts.overlap:]
+                buf = buf[body_len:]
+                if eof and not buf:
                     break
+
+            # probe's frame count can undercount; anything left is processed rather
+            # than dropped, on fixed segments, and said out loud because it means the
+            # cut-aware plan did not cover the whole clip.
+            while buf or not eof:
+                while not eof and len(buf) < opts.segment + opts.overlap:
+                    f = next_frame()
+                    if f is None:
+                        eof = True
+                        break
+                    buf.append(f)
+                    n += 1
+                if not buf:
+                    break
+                body_len = min(opts.segment, len(buf))
+                ahead_len = min(opts.overlap, len(buf) - body_len)
+                left = hist[-opts.overlap:] if opts.overlap else []
+                body, ahead = buf[:body_len], buf[body_len:body_len + ahead_len]
+                n_seg += 1
+                say(f"[pp] segment {n_seg} (beyond the planned {len(plan)}): "
+                    f"{body_len} frames -- the source reported {est_total} frames but "
+                    f"has more, so these are cut on size, not on shots")
+                ts = time.monotonic()
+                out = worker.inpaint(np.stack(left + body + ahead),
+                                     region.inpaint_mask)
+                t_model += time.monotonic() - ts
+                model_frames += len(left) + body_len + ahead_len
+                for i in range(len(left), len(left) + body_len):
+                    emit(np.ascontiguousarray(out[i]))
+                    emitted += 1
+                if opts.overlap:
+                    hist = (hist + body)[-opts.overlap:]
+                buf = buf[body_len:]
         except BrokenPipeError:
             broken = True
         finally:
@@ -540,6 +729,13 @@ def run_propainter(
         os.replace(tmp, dst)          # atomic
 
     total = time.monotonic() - t_start
+    if nonfinite_total:
+        say(f"[pp] WARNING {nonfinite_total} non-finite model output value(s) across "
+            f"{len(nonfinite_at)} frame(s): {sorted(nonfinite_at)[:12]}"
+            f"{'...' if len(nonfinite_at) > 12 else ''}")
+        say(f"[pp]         Those became arbitrary bytes in the repaired region. This "
+            f"is upstream behaviour, not silently corrected here. Re-run with "
+            f"--no-fp16; if it persists in fp32 the model is diverging on this clip.")
     waste = model_frames - n
     pct = lambda x: 100 * x / max(total, 1e-6)          # noqa: E731
     say(f"[pp] {n} frames repaired in {_hms(t_model)} "
@@ -552,10 +748,11 @@ def run_propainter(
     # stops being invisible. Decode and composite no longer have a slice of their own:
     # they run in their own threads alongside the model, which is the point -- what is
     # left of them shows up as the gap between model time and total.
+    rest = max(0.0, total - t_model - t_load - t_cuts)
     say(f"[pp] TIME  load {_hms(t_load)} ({pct(t_load):.0f}%)  "
+        f"cuts {_hms(t_cuts)} ({pct(t_cuts):.0f}%)  "
         f"model {_hms(t_model)} ({pct(t_model):.0f}%)  "
-        f"decode+composite, overlapped {_hms(max(0.0, total - t_model - t_load))} "
-        f"({pct(max(0.0, total - t_model - t_load)):.0f}%)")
+        f"decode+composite, overlapped {_hms(rest)} ({pct(rest):.0f}%)")
     say(f"[pp] TOTAL {_hms(total)} for {n} frames "
         f"({n / max(total, 1e-6):.2f} fps, "
         f"{total / max(info.duration, 1e-6):.1f}x realtime)  "

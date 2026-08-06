@@ -189,6 +189,10 @@ class ProPainterWorker:
         if mask.shape[:2] != (h0, w0):
             raise ValueError(f"mask is {mask.shape[:2]}, frames are {(h0, w0)}")
 
+        # Per call, so the caller can attribute a divergence to a segment.
+        self.nonfinite = 0
+        self.nonfinite_frames: set[int] = set()
+
         pad_h, pad_w = -h0 % ALIGN, -w0 % ALIGN
         frames_rgb = self._pad_frames(frames_bgr[..., ::-1], pad_h, pad_w)
         mask_p = np.pad(mask, ((0, pad_h), (0, pad_w)))   # zeros: nothing to fill there
@@ -372,6 +376,20 @@ class ProPainterWorker:
             )
             pred_img = pred_img.view(-1, 3, h, w)
             pred_img = ((pred_img + 1) / 2).cpu().permute(0, 2, 3, 1).numpy() * 255
+
+            # Upstream casts this straight to uint8 with no finite check, and numpy's
+            # "invalid value encountered in cast" for a NaN or an inf produces an
+            # arbitrary byte -- a visibly wrong pixel, in the one region we are
+            # supposed to be repairing. Counted rather than clipped: clipping would
+            # change upstream's output and turn the parity assertion red, and a
+            # silently corrected NaN teaches nobody that the model diverged. fp16 is
+            # the usual reason it happens, so `--no-fp16` is the first thing to try
+            # when this count is not zero.
+            bad = int((~np.isfinite(pred_img)).sum())
+            if bad:
+                self.nonfinite += bad
+                self.nonfinite_frames.update(neighbor_ids)
+
             binary = masks_dilated[0, neighbor_ids].cpu().permute(0, 2, 3, 1).numpy().astype(np.uint8)
 
             for i, idx in enumerate(neighbor_ids):

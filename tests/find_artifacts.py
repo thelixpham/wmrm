@@ -101,6 +101,9 @@ def main() -> int:
     ap.add_argument("--segment", type=int, default=400,
                     help="--pp-segment the run used, to annotate boundaries (default 400)")
     ap.add_argument("--overlap", type=int, default=20)
+    ap.add_argument("--ref-stride", type=int, default=10,
+                    help="--pp-ref-stride the run used; sets what counts as a shot "
+                         "too short for the model to find references inside (default 10)")
     ap.add_argument("--scene-threshold", type=float, default=0.3)
     ap.add_argument("--z", type=float, default=6.0,
                     help="flag frames beyond this many MADs (default 6)")
@@ -167,9 +170,18 @@ def main() -> int:
     print(f"{len(cuts)} scene cut(s), {len(bounds)} segment boundar(y/ies) at frames "
           f"{bounds}")
 
-    flagged = sorted(
+    # Count before truncating. The first version sliced to --top and then reported
+    # len(flagged), so a clip with 90 bad frames printed "25 frame(s) beyond 6.0 MADs"
+    # -- a number that looks like a finding and is really the value of --top. Anything
+    # that truncates has to say so.
+    all_flagged = sorted(
         (i for i in range(n) if zf[i] > args.z or zj[i] > args.z),
-        key=lambda i: -max(zf[i], zj[i]))[:args.top]
+        key=lambda i: -max(zf[i], zj[i]))
+    flagged = all_flagged[:args.top]
+    if len(all_flagged) > len(flagged):
+        print(f"\n{len(all_flagged)} frame(s) beyond {args.z} MADs "
+              f"({100 * len(all_flagged) / n:.1f}% of the clip); showing the worst "
+              f"{len(flagged)}. Raise --top to see the rest.")
 
     if not flagged:
         print(f"\nno frame beyond {args.z} MADs on either signal -- nothing anomalous "
@@ -177,7 +189,9 @@ def main() -> int:
               f"enough to shift the median hides from this test.")
         return 0
 
-    print(f"\n{len(flagged)} frame(s) beyond {args.z} MADs, worst first:")
+    print(f"\n{len(all_flagged)} frame(s) beyond {args.z} MADs"
+          + (f", worst {len(flagged)} shown:" if len(all_flagged) > len(flagged)
+             else ", worst first:"))
     print(f"{'frame':>7} {'time':>8} {'fill':>7} {'z':>6} {'jump':>7} {'z':>6}  "
           f"{'nearest cut':>14}  {'nearest boundary':>18}")
     for i in sorted(flagged):
@@ -189,22 +203,53 @@ def main() -> int:
         print(f"{i:>7} {t:>7.2f}s {f[i]:>7.2f} {zf[i]:>6.1f} {j[i]:>7.2f} "
               f"{zj[i]:>6.1f}  {cut_s:>14}  {b_s:>18}")
 
-    # The verdict is which explanation the flagged frames cluster on, not whether any
-    # single one is near something -- with a cut every two seconds, "near a cut" is
-    # true of almost any frame by chance, and saying so would be reading tea leaves.
-    near_cut = sum(1 for i in flagged
-                   if min((abs(i / fps - c) for c in cuts), default=9e9) < 0.25)
+    # Which explanation the flagged frames cluster on, not whether any single one is
+    # near something -- with a cut every two seconds, "near a cut" is true of almost
+    # any frame by chance.
+    #
+    # The shot test is the one that matters, and getting it wrong once is why it is
+    # spelled out here. A first version asked only "is this frame close to a cut",
+    # which missed the real case completely: the artifact filled a whole 30-frame shot
+    # between two cuts, and its middle frames are half a second from either one, so
+    # they failed a proximity test while being the clearest evidence in the run. The
+    # defect is not located *at* the cut; it covers shots too short for the model to
+    # find references inside, so the question to ask about a frame is which shot it is
+    # in and how long that shot is.
+    shot_starts = [0] + [int(round(c * fps)) for c in cuts] + [n]
+    shot_of = np.zeros(n, int)
+    shot_len = np.zeros(n, int)
+    for a, b in zip(shot_starts, shot_starts[1:]):
+        a, b = max(0, a), min(n, b)
+        if b > a:
+            shot_of[a:b] = a
+            shot_len[a:b] = b - a
+
     near_bound = sum(1 for i in flagged
                      if min((abs(i - b) for b in bounds), default=9e9) <= args.overlap)
-    print(f"\nof {len(flagged)} flagged: {near_cut} within 0.25s of a scene cut, "
-          f"{near_bound} within {args.overlap} frames of a segment boundary")
+    # A shot is "short" relative to what the model needs to work inside it: local
+    # neighbours plus at least a few global references, i.e. a few times ref_stride.
+    short = 3 * args.ref_stride
+    in_short = sum(1 for i in flagged if 0 < shot_len[i] <= short)
+    hit_shots = sorted({int(shot_of[i]) for i in flagged})
+
+    print(f"\nof {len(flagged)} flagged: {near_bound} within {args.overlap} frames of a "
+          f"segment boundary, {in_short} inside a shot of <= {short} frames")
+    print(f"shots containing flagged frames (start frame -> length): "
+          + ", ".join(f"{s}->{int(shot_len[s])}f" for s in hit_shots))
+
     if near_bound and near_bound >= len(flagged) / 2:
         print("VERDICT  clustered on segment boundaries -- suspect the context "
               "trimming in video.py, i.e. ours.")
-    elif near_cut and near_cut >= len(flagged) / 2:
-        print("VERDICT  clustered on scene cuts -- flow-guided fill has no valid "
-              "source across a cut. Fix is to segment on cuts rather than every N "
-              "frames, so a segment never spans one.")
+    elif in_short and in_short >= len(flagged) / 2:
+        print("VERDICT  clustered inside short shots. The model fills from other "
+              "frames, and in a shot this short its reference frames come from "
+              "outside it -- a different scene -- while the flow across the cut is "
+              "meaningless. Fix is to segment on cuts, so a segment never spans one "
+              "and every reference is same-shot.")
+    elif any(min((abs(i - s) for s in shot_starts), default=9e9) <= 5 for i in flagged):
+        print("VERDICT  clustered at shot starts rather than through whole shots -- "
+              "the first frames after a cut have one-sided context. Same fix, cheaper: "
+              "do not carry overlap across a cut.")
     else:
         print("VERDICT  no clustering on either. Look at the frames listed above "
               "before changing anything.")

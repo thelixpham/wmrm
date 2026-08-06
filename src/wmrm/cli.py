@@ -159,6 +159,8 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
                                 subvideo_length=args.pp_subvideo,
                                 raft_iter=args.raft_iter,
                                 fp16=not args.no_fp16,
+                                scene_threshold=args.pp_scene_threshold,
+                                min_shot=args.pp_min_shot,
                                 workers=args.pp_workers),
         )
     if args.quality == "fast":
@@ -283,15 +285,18 @@ def cmd_detect(args) -> int:
     print(f"zoomed preview -> {zoom}")
     if det and det.opacity == "semi":
         print(
-            "\nNOTE: the watermark looks semi-transparent (background bleeds through).\n"
-            "      Alpha un-blend could recover the original almost exactly; that path\n"
-            "      is not implemented yet -- inpainting is used for now."
+            "\nNOTE: the watermark looks semi-transparent (background bleeds through),\n"
+            "      so --quality unblend can recover the original background by dividing\n"
+            "      the blend back out instead of repainting the region. It is the fast\n"
+            "      CPU option and it cannot flicker; --quality video (the default) is\n"
+            "      the one that removes the mark completely, and wants a GPU."
         )
     print(
-        "\nLOOK AT THE PREVIEW before running. Nothing was processed.\n"
-        "If the box is right:\n"
+        "\nLOOK AT THE PREVIEW. Detection is a guess with measured failure modes.\n"
+        f"  {zoom}\n"
+        "This command only wrote the box; to process with it:\n"
         f"  wmrm run {src} --preset {preset_path}\n"
-        "If it is wrong, measure it yourself and pass it directly:\n"
+        "If the box is wrong, measure it yourself and pass it directly:\n"
         f"  wmrm run {src} --box x,y,w,h"
     )
     return 0
@@ -509,21 +514,27 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                         "way -- check it, detection is a guess")
     p.add_argument("--corner", choices=CORNERS, default="tr",
                    help="corner to search with --detect (default tr)")
-    # Default is un-blend, not LaMa. On the footage this tool was built for the
-    # mark is semi-transparent, so the background is still present in the signal
-    # and recovering it beats generating a replacement on every axis that was
-    # measured: temporal correlation 0.98 vs 0.30, 34 fps vs 1.4, and surrounding
-    # detail left intact instead of repainted. LaMa stays available for genuinely
-    # opaque marks, where there is nothing to recover.
+    # Default is ProPainter. It is the only engine that reaches zero residual without
+    # inventing content per frame -- measured on the reference clip, residual 11.36
+    # against a background floor of 12.24, so nothing findable is left, at temporal
+    # correlation 0.82. Un-blend gets 13.02 at correlation 0.99: it cannot flicker and
+    # it damages nothing, but its leftover is proportional to the error in an alpha it
+    # has to estimate from statistics that are unobservable under the mark, so it can
+    # never reach zero and the mark stays faintly detectable.
+    #
+    # The cost of this default is a hard dependency on a GPU: 0.27 fps on six CPU
+    # cores, ~1.8 hours per minute of 1080p. That is not a slow default, it is a
+    # non-functional one, so the video path refuses to run on CPU unless --device cpu
+    # says to. Un-blend remains the right answer without a card, and for a
+    # semi-transparent mark over detail it is still the least destructive engine here.
     p.add_argument("--quality", choices=("unblend", "video", "high", "fast", "draft"),
-                   default="unblend",
-                   help="unblend = solve the alpha blend and RECOVER the real "
-                        "background (default) -- keeps every pixel, but leaves a "
-                        "faint trace; "
-                        "video = ProPainter, fills from neighbouring frames -- the "
-                        "only one that removes the mark COMPLETELY without "
-                        "inventing per frame. Needs a GPU and a ProPainter "
-                        "checkout; "
+                   default="video",
+                   help="video = ProPainter, fills from neighbouring frames (default) "
+                        "-- the only one that removes the mark COMPLETELY without "
+                        "inventing per frame. Needs a GPU; "
+                        "unblend = solve the alpha blend and RECOVER the real "
+                        "background -- keeps every pixel and cannot flicker, runs at "
+                        "34 fps on CPU, but leaves a faint trace; "
                         "high = LaMa inpainting on a crop tile, per frame; "
                         "fast = ffmpeg delogo+feather, smears on texture; "
                         "draft = cv2.inpaint, lowest quality")
@@ -531,8 +542,22 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                    help="path to the ProPainter checkout (else $PROPAINTER_HOME, "
                         "else a sibling directory of this project)")
     p.add_argument("--pp-segment", type=int, default=400,
-                   help="frames per ProPainter invocation (default 400). It loads a "
-                        "whole segment into memory, so lower this if you run out")
+                   help="MAXIMUM frames per ProPainter invocation (default 400). It "
+                        "loads a whole segment into memory, so lower this if you run "
+                        "out. Segments also stop at scene cuts, so most are shorter")
+    p.add_argument("--pp-scene-threshold", type=float, default=0.3,
+                   help="ffmpeg scene score above which a frame starts a new shot "
+                        "(default 0.3). Segments never span a cut, because the model "
+                        "fills from other frames and across a cut those belong to a "
+                        "different scene: measured, a 30-frame shot inside a 440-frame "
+                        "segment had the watermark region filled with the wrong "
+                        "scene's content for its whole duration. 0 disables detection "
+                        "and cuts every --pp-segment frames regardless of content")
+    p.add_argument("--pp-min-shot", type=int, default=16,
+                   help="shots shorter than this are merged with the previous one "
+                        "(default 16). Below roughly a dozen frames the model has "
+                        "nothing to propagate from, so an impure segment beats an "
+                        "empty one")
     p.add_argument("--pp-subvideo", type=int, default=80,
                    help="frames per inference chunk inside one segment (default 80). "
                         "This, not --pp-segment, is what caps VRAM during inference: "
