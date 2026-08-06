@@ -282,9 +282,18 @@ def run_propainter(
             # that keeps it -- so out-of-order completion cannot reorder the video.
             # Consuming eagerly also means at most `workers` output directories are
             # alive at once instead of all of them.
+            # Announce each segment as it *starts*, not only when it finishes.
+            # Reporting completions alone made a concurrent run read as a serial one
+            # -- three segments all logging the same elapsed time looks like a stuck
+            # clock unless you already know they were launched together.
+            def launch(item):
+                si, seg_in, out_dir, start, end, lo, hi = item
+                say(f"[pp] segment {si + 1}/{n_seg} start: frames {start}-{end - 1} "
+                    f"(+{start - lo}/{hi - end} context) at {_hms(time.monotonic() - t0)}")
+                return _run_segment(opts, seg_in, mask_png, out_dir)
+
             with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(_run_segment, opts, it[1], mask_png, it[2]): it
-                        for it in plan}
+                futs = {pool.submit(launch, it): it for it in plan}
                 for fut in cf.as_completed(futs):
                     item = futs[fut]
                     done_frames += collect(item, fut.result())

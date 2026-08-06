@@ -515,10 +515,14 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                    help="frames per ProPainter invocation (default 400). It loads a "
                         "whole segment into memory, so lower this if you run out")
     p.add_argument("--pp-workers", type=int, default=1,
-                   help="segments to run concurrently (default 1). The tile is small "
-                        "for a modern GPU, so one segment leaves it mostly idle and "
-                        "2-4 often scales nearly linearly. Output is identical either "
-                        "way. Watch the reported fps and back off on out-of-memory")
+                   help="segments to run concurrently (default 1). Output is "
+                        "identical either way, so this is purely a speed knob. How "
+                        "much it buys depends on the card: measured on an A40 a "
+                        "single segment already sat at 99%% utilisation and 282W of "
+                        "a 300W limit, so the gain there comes from overlapping the "
+                        "per-segment startup, not from filling an idle GPU. Plenty "
+                        "of free VRAM is not evidence it will help -- compare the "
+                        "reported fps")
     p.add_argument("--raft-iter", type=int, default=20,
                    help="ProPainter optical-flow iterations (default 20). Lower is "
                         "faster and less accurate")
