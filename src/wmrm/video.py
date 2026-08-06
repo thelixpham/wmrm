@@ -42,11 +42,13 @@ Integration notes, each one a thing that bit:
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +72,15 @@ class ProPainterError(RuntimeError):
     pass
 
 
+def _hms(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{seconds:.1f}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 @dataclass
 class ProPainterOpts:
     repo: Path
@@ -82,6 +93,11 @@ class ProPainterOpts:
     raft_iter: int = 20
     mask_dilation: int = 4
     fp16: bool = True
+    # Segments run concurrently. Default 1 because the right number depends on VRAM
+    # and on how much of the GPU one segment already uses -- neither is knowable from
+    # here. Raise it and watch the reported fps; stop when it stops improving or the
+    # device runs out of memory.
+    workers: int = 1
 
 
 def find_repo(explicit: str | os.PathLike | None = None) -> Path:
@@ -210,6 +226,10 @@ def run_propainter(
         step = max(1, opts.segment)
         n_seg = (n + step - 1) // step
 
+        # Stage every segment's input up front. These are directories of symlinks --
+        # no pixels are copied -- so the whole set costs kilobytes even for an hour
+        # of video, and having them ready means a worker never waits on setup.
+        plan = []                   # (si, seg_in, out_dir, start, end, lo, hi)
         for si, start in enumerate(range(0, n, step)):
             end = min(n, start + step)
             lo = max(0, start - opts.overlap)
@@ -221,10 +241,11 @@ def run_propainter(
                 # Symlink rather than copy: the frames are already on disk and a
                 # long video would otherwise be written twice.
                 (seg_in / f"{j - lo:06d}.png").symlink_to(src_frames[j])
+            plan.append((si, seg_in, work / f"out{si:04d}", start, end, lo, hi))
 
-            say(f"[pp] segment {si + 1}/{n_seg}: frames {start}-{end - 1} "
-                f"(+{start - lo}/{hi - end} context)")
-            got = _run_segment(opts, seg_in, mask_png, work / f"out{si:04d}")
+        def collect(item, got: Path) -> int:
+            """Move one finished segment's kept frames into `clean`."""
+            si, seg_in, out_dir, start, end, lo, hi = item
             produced = sorted(got.glob("*.png"))
             if len(produced) != hi - lo:
                 raise ProPainterError(
@@ -233,7 +254,47 @@ def run_propainter(
             for j in range(start, end):
                 shutil.copyfile(produced[j - lo], clean / f"{j:06d}.png")
             shutil.rmtree(seg_in, ignore_errors=True)
-            shutil.rmtree(work / f"out{si:04d}", ignore_errors=True)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return end - start
+
+        workers = max(1, min(opts.workers, len(plan)))
+        say(f"[pp] {n_seg} segment(s) of {step} frames, {workers} at a time")
+        t0 = time.monotonic()
+        done_frames = 0
+
+        if workers == 1:
+            for item in plan:
+                si, seg_in, out_dir, start, end, lo, hi = item
+                say(f"[pp] segment {si + 1}/{n_seg}: frames {start}-{end - 1} "
+                    f"(+{start - lo}/{hi - end} context)")
+                ts = time.monotonic()
+                done_frames += collect(item, _run_segment(opts, seg_in, mask_png,
+                                                          out_dir))
+                say(f"[pp]   {_hms(time.monotonic() - ts)}  "
+                    f"{done_frames / (time.monotonic() - t0):.2f} fps avg")
+        else:
+            # Threads, not processes: every task blocks in subprocess.run, which
+            # releases the GIL for the whole of the work that matters.
+            #
+            # Results are consumed as they complete rather than in submission order.
+            # That is safe *here* specifically because segments write disjoint
+            # filenames into `clean` -- frame j only ever comes from the one segment
+            # that keeps it -- so out-of-order completion cannot reorder the video.
+            # Consuming eagerly also means at most `workers` output directories are
+            # alive at once instead of all of them.
+            with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {pool.submit(_run_segment, opts, it[1], mask_png, it[2]): it
+                        for it in plan}
+                for fut in cf.as_completed(futs):
+                    item = futs[fut]
+                    done_frames += collect(item, fut.result())
+                    el = time.monotonic() - t0
+                    say(f"[pp] segment {item[0] + 1}/{n_seg} done  "
+                        f"({done_frames}/{n} frames, {_hms(el)}, "
+                        f"{done_frames / el:.2f} fps avg)")
+
+        say(f"[pp] {n} frames repaired in {_hms(time.monotonic() - t0)} "
+            f"({n / max(time.monotonic() - t0, 1e-6):.2f} fps, {workers} worker(s))")
 
         done = sorted(clean.glob("*.png"))
         if len(done) != n:
