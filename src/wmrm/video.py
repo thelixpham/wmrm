@@ -552,20 +552,64 @@ def _inpaint_or_split(worker, block: list, mask, say, depth: int = 0):
         return np.concatenate([first[:half], second[ctx:]])
 
 
-def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float) -> list[int]:
+def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float, *,
+                 hwaccel: bool = False, say=lambda m: None) -> list[int]:
     """Frame indices where a new shot begins, via ffmpeg's scene score.
 
     One extra decode of the video, which is affordable here only because decoding is a
     small slice of this engine's cost: measured 7% against 77% for the model. It is not
     affordable at all in the un-blend path, which is why this lives here.
+
+    On a GPU box it decodes through NVDEC. This is the one step where decode is 100% of
+    the cost rather than 7%, and `select='gt(scene,...)'` scores each frame against its
+    predecessor, so the work is serial no matter how many cores are free -- measured on
+    a 128-core EPYC, the CPU path pinned 1.8 cores and left 126 idle. Handing decode to
+    the card fixes what the cores could not: measured on 120s of 1080p with a 4090,
+    32.9s wall / 54.0s CPU became 6.8s wall / 3.0s CPU, same cuts found. That is 4.8x
+    on the clock and 18x less CPU, which for a 2.6-hour film is ~43 minutes down to ~9.
+
+    Two things were measured and rejected before this. Downscaling ahead of the filter
+    (what PySceneDetect does) is 0.8x here -- ffmpeg still decodes at full resolution,
+    so the scale is pure added work. Splitting the timeline across parallel ffmpegs
+    finds identical cuts but only pays when cores are the constraint, and they are not:
+    it was 1.2x on a box whose serial pass already used 4.3 of 6 cores.
     """
     if threshold <= 0:
         return []
-    res = subprocess.run(
-        [ffmpeg, "-v", "error", "-nostdin", "-i", str(src),
-         "-vf", f"select='gt(scene,{threshold})',metadata=print:file=-",
-         "-an", "-f", "null", "-"],
-        capture_output=True, text=True)
+
+    def attempt(extra: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [ffmpeg, "-v", "error", "-nostdin", *extra, "-i", str(src),
+             "-vf", f"select='gt(scene,{threshold})',metadata=print:file=-",
+             "-an", "-f", "null", "-"],
+            capture_output=True, text=True)
+
+    res = None
+    if hwaccel:
+        res = attempt(["-hwaccel", "cuda"])
+        if res.returncode != 0:
+            # NVDEC refuses some profiles and bit depths outright. Falling back is
+            # correct, doing it silently is not: the CPU path is 5x slower and the
+            # run would just look mysteriously slow.
+            say(f"[pp] NVDEC declined this file, decoding scene cuts on the CPU "
+                f"instead (~5x slower): {_first_error(res.stderr)}")
+            res = None
+    if res is None:
+        res = attempt([])
+
+    # A failed decode used to be indistinguishable from a clean scan that found
+    # nothing: no pts_time lines either way, so the caller reported "no scene cuts
+    # found" and planned fixed segments. That silently discards the cut protection
+    # this function exists to provide, which is exactly the case where a segment
+    # spans a cut and the watermark region gets filled from the wrong scene.
+    if res.returncode != 0:
+        raise EncodeError(
+            f"scene detection failed to decode {src.name}: "
+            f"{_first_error(res.stderr)}\n"
+            f"  pass --pp-scene-threshold 0 to skip it, but read what that costs "
+            f"in the --pp-scene-threshold help first"
+        )
+
     out = set()
     for line in (res.stdout + res.stderr).splitlines():
         if "pts_time:" in line:
@@ -574,6 +618,13 @@ def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float) -> list[i
             except (IndexError, ValueError):
                 continue
     return sorted(out)
+
+
+def _first_error(stderr: str) -> str:
+    for line in stderr.splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return "no error message"
 
 
 def _segment_plan(shot_starts: list[int], total: int, segment: int,
@@ -668,7 +719,16 @@ def run_propainter(
             f"segment, and not per file in a batch)")
 
     t0 = time.monotonic()
-    shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps))
+    # NVDEC whenever there is a card and the user has not asked for CPU. Nothing about
+    # the result changes -- it is the same filter over the same frames -- so this is a
+    # speed decision only, and _shot_starts falls back on its own if the card refuses.
+    use_nvdec = bool(hw["gpu"]) and opts.device != "cpu"
+    if opts.scene_threshold > 0:
+        say(f"[pp] scanning for scene cuts ({info.nframes or '?'} frames to decode, "
+            f"the one step here that is pure decode)"
+            + (" -- via NVDEC" if use_nvdec else " -- on the CPU"))
+    shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps),
+                               hwaccel=use_nvdec, say=say)
     _plan_est_total = info.nframes or (1 << 30)
     plan = _segment_plan(shot_starts, _plan_est_total, opts.segment, opts.overlap,
                          opts.min_shot)
