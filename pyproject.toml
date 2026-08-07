@@ -16,6 +16,28 @@ dependencies = [
 # has its videos locally should not have to install an AWS SDK to inpaint them.
 r2 = ["boto3>=1.34"]
 
+[tool.uv]
+# simple-lama-inpainting 0.1.2 declares upper bounds that its code does not
+# actually need, and the project has been running past all of them: measured in
+# the working venv, LaMa imports and runs under pillow 12.2 and numpy 2.4
+# against declared caps of <10 and <2. Nobody hit this before because that venv
+# was built with --no-deps; asking uv to resolve the project properly (which is
+# what installing any extra does) is what surfaced it.
+#
+# So these are stale metadata, not a real incompatibility. Overriding is the
+# honest fix -- the alternative is pinning pillow<10 and numpy<2 across the
+# whole project to satisfy a bound that buys nothing.
+override-dependencies = [
+    "pillow>=9.5.0",
+    "numpy>=1.24.3",
+    # opencv-python is dropped rather than relaxed. wmrm depends on
+    # opencv-python-headless, and the two ship the same `cv2` module -- letting
+    # both in means whichever landed last wins the import, which is a coin flip
+    # to debug. The marker is simply never true, which is how uv expresses
+    # "remove this requirement".
+    "opencv-python; python_version < '0'",
+]
+
 [project.scripts]
 wmrm = "wmrm.cli:main"
 
