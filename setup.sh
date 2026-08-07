@@ -140,7 +140,7 @@ uv pip install --quiet "pillow>=10" opencv-python-headless numpy
 # requirements are ours to satisfy.
 uv pip install --quiet av addict einops future scipy scikit-image imageio \
                        imageio-ffmpeg pyyaml requests timm matplotlib
-uv pip install boto3
+uv pip install --quiet boto3
 ok "dependencies installed"
 
 log "wmrm"
