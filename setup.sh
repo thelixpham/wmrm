@@ -101,12 +101,39 @@ if [[ -n "${CUDA:-}" ]]; then
   cuda="$CUDA"
   ok "index pinned by CUDA=$cuda"
 elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-  # cu124 wants driver >= 550. Reading the driver rather than assuming is the
-  # difference between a working install and one that imports and then segfaults.
+  # Two independent constraints, and reading only one of them is how this went
+  # wrong before:
+  #
+  #   driver  -- an index newer than the driver fails to initialise CUDA at all.
+  #   card    -- an index older than the card's compute capability installs fine,
+  #              reports the right GPU name and VRAM, loads every model, and then
+  #              dies at the first kernel launch with "no kernel image is
+  #              available for execution on the device".
+  #
+  # This used to check only the driver, so an RTX PRO 4000 Blackwell (sm_120) on a
+  # new driver picked cu124, whose newest architecture is sm_90. Everything looked
+  # correct right up to the point it wasn't.
   driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
   major="${driver%%.*}"
+  gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+  # compute_cap is "12.0" for Blackwell, "8.9" for Ada, "8.6" for Ampere. Older
+  # nvidia-smi does not know the field, hence the fallback.
+  cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+
   if (( major >= 550 )); then cuda=cu124; else cuda=cu121; fi
-  ok "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1), driver $driver -> $cuda"
+  cap_major="${cap%%.*}"
+  if [[ -n "$cap" && "$cap_major" =~ ^[0-9]+$ ]] && (( cap_major >= 12 )); then
+    # Blackwell and newer. cu124 tops out at sm_90, so it is not an option here
+    # regardless of how new the driver is.
+    cuda=cu128
+    ok "$gpu_name (compute $cap), driver $driver -> $cuda (needs >= cu128 for sm_${cap/./})"
+  elif [[ -z "$cap" ]]; then
+    warn "$gpu_name, driver $driver -> $cuda (this nvidia-smi cannot report"
+    warn "compute_cap, so the card's architecture was not checked -- the"
+    warn "verification step below is what will catch a mismatch)"
+  else
+    ok "$gpu_name (compute $cap), driver $driver -> $cuda"
+  fi
 else
   cuda=cpu
   warn "no GPU detected -> CPU build. The default engine (ProPainter) needs a GPU and"
@@ -166,6 +193,24 @@ if torch.version.cuda and not gpu:
 if gpu:
     print(f"    device: {torch.cuda.get_device_name(0)}, "
           f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    # The check that the index choice above is only a guess about. Everything
+    # else here passes on a wheel with no kernels for this card: it reports the
+    # right name, the right VRAM, and cuda available True. Only the architecture
+    # list distinguishes a usable install from one that dies at the first kernel
+    # launch, ~10s into a run, with a message naming neither the card nor the
+    # wheel.
+    major, minor = torch.cuda.get_device_capability(0)
+    want, arches = f"sm_{major}{minor}", torch.cuda.get_arch_list()
+    print(f"    arch: card needs {want}, torch has "
+          f"{', '.join(arches) if arches else 'nothing'}")
+    if arches and want not in arches:
+        newest = max((a for a in arches if a.startswith("sm_")), default="none",
+                     key=lambda a: int(a[3:]))
+        bad.append(
+            f"this torch has no kernels for this GPU: card is {want}, the wheel's "
+            f"newest is {newest}. It will load models fine and then fail at the "
+            f"first kernel launch. Re-run with a newer index, e.g. "
+            f"CUDA=cu130 ./setup.sh")
 
 # The mismatch that names neither package when it fails.
 try:
