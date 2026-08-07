@@ -564,6 +564,48 @@ def cmd_coverage(args) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_pull(args) -> int:
+    """Fetch a source video out of R2 so the normal commands can work on it.
+
+    Deliberately a separate step rather than a URI accepted by `run`: the
+    download is hours at these sizes, it is resumable on its own, and the
+    processing that follows is not. Keeping them apart means a failed run does
+    not re-download 80 GB, and the file stays around for a second attempt with a
+    different box.
+    """
+    from .r2 import Creds, R2Error, download, ls, stat
+
+    try:
+        if args.list:
+            creds = Creds.from_env(args.bucket)
+            objects = ls(args.key, bucket=args.bucket, creds=creds, limit=args.limit)
+            if not objects:
+                print(f"nothing under {args.key!r} in "
+                      f"{args.bucket or creds.bucket}", file=sys.stderr)
+                return 1
+            for key, size in objects:
+                print(f"{size:>14}  {key}")
+            return 0
+
+        if args.stat:
+            print(stat(args.key, bucket=args.bucket).describe())
+            return 0
+
+        dest = Path(args.output) if args.output else Path.cwd()
+        path = download(args.key, dest, bucket=args.bucket, chunk=args.chunk_mib << 20,
+                        workers=args.workers, progress=not args.quiet,
+                        overwrite=args.force)
+    except R2Error as exc:
+        raise SystemExit(f"error: {exc}")
+
+    info = probe(path)
+    print(f"\n{path}\n  {info.width}x{info.height} @ {info.fps} fps, "
+          f"{info.duration:.1f}s, audio {'yes' if info.has_audio else 'none'}")
+    print(f"\nnext:\n  wmrm detect {path} --corner tr\n  wmrm run {path} --preset "
+          f"{path.with_name('wm-preset.json')}")
+    return 0
+
+
 def cmd_verify(args) -> int:
     orig, proc = Path(args.original), Path(args.processed)
     info = probe(orig)
@@ -782,6 +824,30 @@ def build_parser() -> argparse.ArgumentParser:
                    help="edge threshold for the gradient signal (default 2)")
     _add_region_args(c)
     c.set_defaults(func=cmd_coverage)
+
+    pull = sub.add_parser("pull", help="download a source video from Cloudflare R2")
+    pull.add_argument("key",
+                      help="object key, or r2://bucket/key. "
+                           "e.g. uploads/3d80.../MOGI-125.mp4")
+    pull.add_argument("-o", "--output", default=None,
+                      help="file or directory to write to (default: cwd)")
+    pull.add_argument("--bucket", default=None,
+                      help="bucket name (default: $R2_BUCKET, or the one in the URI)")
+    pull.add_argument("--workers", type=int, default=8,
+                      help="parallel ranged GETs (default 8). More only helps until "
+                           "the link or the disk saturates -- watch the reported rate")
+    pull.add_argument("--chunk-mib", type=int, default=64,
+                      help="chunk size in MiB (default 64). This is also the resume "
+                           "granularity: an interrupted chunk is re-fetched whole")
+    pull.add_argument("--force", action="store_true",
+                      help="re-download even if the file is already there")
+    pull.add_argument("--stat", action="store_true",
+                      help="print the object's size and etag, download nothing")
+    pull.add_argument("--list", action="store_true",
+                      help="list keys under KEY as a prefix, download nothing")
+    pull.add_argument("--limit", type=int, default=200, help="--list cap (default 200)")
+    pull.add_argument("--quiet", action="store_true", help="no progress line")
+    pull.set_defaults(func=cmd_pull)
 
     v = sub.add_parser("verify", help="compare an original and a processed file")
     v.add_argument("original")

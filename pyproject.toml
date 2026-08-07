@@ -11,6 +11,11 @@ dependencies = [
     "simple-lama-inpainting>=0.1.2",
 ]
 
+[project.optional-dependencies]
+# Only `wmrm pull` needs this, and it imports lazily -- a machine that already
+# has its videos locally should not have to install an AWS SDK to inpaint them.
+r2 = ["boto3>=1.34"]
+
 [project.scripts]
 wmrm = "wmrm.cli:main"
 
