@@ -71,6 +71,23 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
               "Detection is a guess, not a guarantee.\n")
         box = det.box
         preset = Preset.from_box(box, width, height, opacity=det.opacity)
+        # Write the box down, next to the preview and for the same reason: this run is
+        # about to spend hours on a guess, and "what box was it actually made with" is
+        # the first question anyone asks when an output looks wrong. It also saves
+        # running `detect` by hand purely to get a file to pass to --preset.
+        #
+        # A record, not an input. Nothing picks this up on its own, and that asymmetry
+        # is deliberate -- a preset that merely happens to exist quietly overriding
+        # what the command asked for is the exact failure run.sh already names.
+        saved = src.with_name(f"{src.stem}-preset.json")
+        try:
+            preset.save(saved)
+            print(f"box written -> {saved}\n"
+                  f"  reuse it with --preset {saved.name}; left alone it is only a "
+                  f"record, detection still runs by default", file=sys.stderr)
+        except OSError as exc:
+            # A read-only mount next to the source is not a reason to refuse the work.
+            print(f"[wmrm] note: could not write {saved}: {exc}", file=sys.stderr)
     elif args.preset:
         path = Path(args.preset)
         if not path.exists():
