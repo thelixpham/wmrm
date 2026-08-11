@@ -110,7 +110,7 @@ class ProPainterError(RuntimeError):
 
 
 def _join_parts(ffmpeg: str, parts_dir: Path, work: Path, src: Path, dst: Path,
-                info, encode: EncodeOpts, expect: int, say) -> Path:
+                info, encode: EncodeOpts, expect: int, part_frames: int, say) -> Path:
     """Concatenate the parts into one file and prove it holds every frame.
 
     This is the only step that is not resumable, and it does not need to be: it is a
@@ -127,9 +127,23 @@ def _join_parts(ffmpeg: str, parts_dir: Path, work: Path, src: Path, dst: Path,
             raise EncodeError(f"the parts in {parts_dir} are not a contiguous run: "
                               f"expected {PART_NAME.format(i)}, found {p.name}")
 
+    # Each part's length is stated here rather than left for the concatenator to read
+    # back out of the container, and this is not belt-and-braces. Every part is
+    # exactly `part_frames` frames long except the last, so the exact duration is
+    # arithmetic -- while the number in the file has been through a container's
+    # timebase and may come back rounded. Measured: on ffmpeg 6.1.1 reading it back
+    # was exact, on another build five 12-frame parts joined 2.4ms long, which
+    # ffprobe then read as 359/12 fps instead of 30000/1001. On a feature-length file
+    # that is audio drift and a `frame rate` failure from `wmrm verify`, from a
+    # rounding error nobody can see in any single part.
+    lines = []
+    for i, p in enumerate(parts):
+        lines.append("file '{}'\n".format(str(p.resolve()).replace("'", r"'\''")))
+        held = min(part_frames, expect - i * part_frames) if expect else 0
+        if held > 0:
+            lines.append(f"duration {float(Fraction(held) / info.fps):.9f}\n")
     listing = work / "parts.txt"
-    listing.write_text("".join(
-        "file '{}'\n".format(str(p.resolve()).replace("'", r"'\''")) for p in parts))
+    listing.write_text("".join(lines))
     tmp_fd, tmp_name = tempfile.mkstemp(
         dir=dst.parent, prefix=f".{dst.stem}.", suffix=dst.suffix or ".mp4")
     os.close(tmp_fd)
@@ -480,6 +494,7 @@ def _part_cmd(ffmpeg: str, src: Path, out: Path, info, tile, alpha_png: Path,
         "-c:v", "libx264", "-crf", str(encode.crf), "-preset", encode.x264_preset,
         "-pix_fmt", "yuv420p",
         "-video_track_timescale", str(_timescale(info.fps)),
+        "-movie_timescale", str(_timescale(info.fps)),
         str(out),
     ]
     return cmd
@@ -504,6 +519,7 @@ def _assemble_cmd(ffmpeg: str, listing: Path, src: Path, dst: Path, info,
         "-map", "0:v:0", "-map", "1:a:0?", "-map_metadata", "1",
         "-c", "copy",
         "-video_track_timescale", str(_timescale(info.fps)),
+        "-movie_timescale", str(_timescale(info.fps)),
     ]
     if encode.faststart:
         cmd += ["-movflags", "+faststart"]
@@ -1454,7 +1470,7 @@ def run_propainter(
             raise
 
         tmp = _join_parts(ffmpeg, parts_dir, work, src, dst, info, encode,
-                          sink.index, say)
+                          sink.index, opts.part_frames, say)
         os.replace(tmp, dst)          # atomic
         shutil.rmtree(parts_dir, ignore_errors=True)
 
