@@ -62,7 +62,20 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
         # always written and every processed file still goes through the usual
         # verification. If detection finds nothing it raises, which aborts the
         # run rather than quietly processing with a bogus box.
-        det = detect(src, corner=args.corner)
+        # Every knob `wmrm detect` exposes, reachable from `run` and `batch` too.
+        # Without this, tuning detection meant running `detect` by hand to write a
+        # preset and then passing it back in -- two commands and a file, purely
+        # because one call site hardcoded the defaults. Anything that decides the
+        # box has to be reachable from the command that uses the box.
+        det = detect(
+            src,
+            corner=args.corner,
+            samples=getattr(args, "samples", 40),
+            roi_frac=getattr(args, "roi_frac", 0.30),
+            grad_threshold=getattr(args, "grad_threshold", None),
+            persistence=getattr(args, "persistence", 0.90),
+            max_area_percent=getattr(args, "max_area", 10.0),
+        )
         print(det.describe())
         preview = src.with_name(f"{src.stem}-preview.png")
         write_preview(src, det.box, preview, roi=det.roi,
@@ -652,14 +665,43 @@ def _add_region_args(p: argparse.ArgumentParser) -> None:
                         "Bigger is slower: cost scales with tile area")
 
 
+def _add_detect_args(p: argparse.ArgumentParser) -> None:
+    """Knobs that decide the box, shared by `detect` and by the commands that use it.
+
+    `run` and `batch` detect on their own when given neither --box nor --preset, so
+    every one of these has to be reachable from them too. It was not: the call site
+    inside `run` passed only --corner and hardcoded the rest, which meant tuning any
+    of them cost a separate `detect` invocation, a preset file, and a second command
+    -- for a value the run was about to compute anyway.
+    """
+    p.add_argument("--corner", choices=CORNERS, default="tr",
+                   help="which corner to search (default tr = top-right)")
+    p.add_argument("--samples", type=int, default=40,
+                   help="frames sampled across the clip (default 40)")
+    p.add_argument("--roi-frac", type=float, default=0.30,
+                   help="corner search window as a fraction of the frame (default 0.30)")
+    p.add_argument("--grad-threshold", type=float, default=None,
+                   help="edge strength threshold. Default: swept automatically from "
+                        "10 down to 1.5, stopping where the box stops growing -- that "
+                        "finds faint marks a fixed threshold misses. Pass a number to "
+                        "override")
+    p.add_argument("--persistence", type=float, default=0.90,
+                   help="fraction of sampled frames a pixel must appear in (default "
+                        "0.90). This is what rejects subtitles and temporary text -- "
+                        "and it also rejects a studio logo that is not on screen for "
+                        "the whole film, so lower it when a second mark in the same "
+                        "corner is being missed, and check the box you get")
+    p.add_argument("--max-area", type=float, default=10.0,
+                   help="reject a candidate larger than this %% of the frame (default 10)")
+
+
 def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--detect", action="store_true",
                    help="find the watermark and process in one go, no preset needed. "
                         "For 'batch' it detects once on the first file and applies "
                         "that box to all of them. A preview PNG is written either "
                         "way -- check it, detection is a guess")
-    p.add_argument("--corner", choices=CORNERS, default="tr",
-                   help="corner to search with --detect (default tr)")
+    _add_detect_args(p)
     # Default is ProPainter. It is the only engine that reaches zero residual without
     # inventing content per frame -- measured on the reference clip, residual 11.36
     # against a background floor of 12.24, so nothing findable is left, at temporal
@@ -789,22 +831,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("detect", help="find the watermark once and write a preset")
     d.add_argument("input")
-    d.add_argument("--corner", choices=CORNERS, default="tr",
-                   help="which corner to search (default tr = top-right)")
-    d.add_argument("--samples", type=int, default=40,
-                   help="frames sampled across the clip (default 40)")
-    d.add_argument("--roi-frac", type=float, default=0.30,
-                   help="corner search window as a fraction of the frame (default 0.30)")
-    d.add_argument("--grad-threshold", type=float, default=None,
-                   help="edge strength threshold. Default: swept automatically from "
-                        "10 down to 1.5, stopping where the box stops growing -- that "
-                        "finds faint marks a fixed threshold misses. Pass a number to "
-                        "override")
-    d.add_argument("--persistence", type=float, default=0.90,
-                   help="fraction of sampled frames a pixel must appear in (default 0.90). "
-                        "This is what rejects subtitles and temporary text")
-    d.add_argument("--max-area", type=float, default=10.0,
-                   help="reject a candidate larger than this %% of the frame (default 10)")
+    _add_detect_args(d)
     d.add_argument("--preview", help="where to write the preview PNG")
     _add_region_args(d)
     d.set_defaults(func=cmd_detect)
