@@ -58,21 +58,24 @@ Integration notes, each one a thing that bit:
 
 from __future__ import annotations
 
+import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .pipeline import EncodeOpts, EncodeError, drain, read_exact
-from .probe import probe, require_tools
+from .probe import ProbeError, probe, require_tools
 from .region import Region, build_region
 
 # Frames per model invocation. Bounded by the fact that the model materialises every
@@ -83,10 +86,75 @@ SEGMENT = 400
 # the first and last frames of a segment have one-sided temporal context and the
 # joins show.
 OVERLAP = 20
+# Frames per composited part, and so the granularity a killed run resumes at.
+# Deliberately independent of the model plan: two runs with different --pp-segment
+# have to produce identical parts (tests/test_video_order.py pins that invariance),
+# and a resumed run has to produce the same parts as the run it continues. 3600 is
+# two minutes of 30fps footage -- small enough that a crash costs little, large
+# enough that per-part ffmpeg startup stays in the noise.
+PART_FRAMES = 3600
+PART_NAME = "part-{:06d}.mp4"
+PART_GLOB = "part-*.mp4"
+MANIFEST = "manifest.json"
+MANIFEST_VERSION = 1
+# How the final flush is watched. The compositor is given as long as it needs, and is
+# declared stuck only when it has not accepted a single frame for STALL_LIMIT. This is
+# a liveness check, not a budget: the thing it has to tolerate is one whole segment
+# arriving at once with the model no longer running to hide the encode behind.
+STALL_POLL = 5.0
+STALL_LIMIT = 300.0
 
 
 class ProPainterError(RuntimeError):
     pass
+
+
+def _join_parts(ffmpeg: str, parts_dir: Path, work: Path, src: Path, dst: Path,
+                info, encode: EncodeOpts, expect: int, say) -> Path:
+    """Concatenate the parts into one file and prove it holds every frame.
+
+    This is the only step that is not resumable, and it does not need to be: it is a
+    stream copy, minutes of I/O against hours of encoding.
+    """
+    parts = sorted(parts_dir.glob(PART_GLOB))
+    if not parts:
+        raise EncodeError(f"no parts to join in {parts_dir}")
+    for i, p in enumerate(parts):
+        # A gap here would produce a video that is complete-looking and missing a
+        # couple of minutes out of the middle, which is the worst way for this to
+        # fail: nothing downstream would notice.
+        if p.name != PART_NAME.format(i):
+            raise EncodeError(f"the parts in {parts_dir} are not a contiguous run: "
+                              f"expected {PART_NAME.format(i)}, found {p.name}")
+
+    listing = work / "parts.txt"
+    listing.write_text("".join(
+        "file '{}'\n".format(str(p.resolve()).replace("'", r"'\''")) for p in parts))
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=dst.parent, prefix=f".{dst.stem}.", suffix=dst.suffix or ".mp4")
+    os.close(tmp_fd)
+    tmp = Path(tmp_name)
+
+    say(f"[pp] joining {len(parts)} part(s) and putting the audio back -- stream "
+        f"copy, nothing is re-encoded")
+    res = subprocess.run(_assemble_cmd(ffmpeg, listing, src, tmp, info, encode),
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise EncodeError(f"joining the parts failed:\n{_first_error(res.stderr)}\n"
+                          f"The parts are still in {parts_dir} -- re-running with "
+                          f"--resume retries just this step.")
+    try:
+        got = probe(tmp).nframes
+    except ProbeError:
+        got = 0
+    if expect and got != expect:
+        tmp.unlink(missing_ok=True)
+        raise EncodeError(
+            f"the joined video holds {got or 'an unreadable number of'} frames, "
+            f"expected {expect}; refusing to ship a video with frames missing or "
+            f"duplicated. The parts are still in {parts_dir}.")
+    return tmp
 
 
 def _hms(seconds: float) -> str:
@@ -114,6 +182,10 @@ class ProPainterOpts:
     # pins it, which is what you want when reproducing a run or bisecting an OOM.
     segment: int | None = None
     overlap: int = OVERLAP
+    # Frames per composited part, which is the granularity a killed run resumes at.
+    # Nothing about the output depends on it -- see PART_FRAMES -- so it is a
+    # crash-cost knob, not a quality one.
+    part_frames: int = PART_FRAMES
     subvideo_length: int = 80
     neighbor_length: int = 10
     ref_stride: int = 10
@@ -321,32 +393,77 @@ def _load_worker(opts: ProPainterOpts) -> tuple[object, bool]:
     return worker, False
 
 
-def _decode_cmd(ffmpeg: str, src: Path, tile) -> list[str]:
-    """Decode the source and emit only the tile, as raw frames on stdout.
+def _decode_cmd(ffmpeg: str, src: Path, tile, start: int = 0,
+                fps: Fraction | None = None) -> list[str]:
+    """Decode the source from frame `start` and emit only the tile, as raw frames.
 
     Cropping in ffmpeg rather than in numpy is what keeps this cheap: a 1080p frame
     is 6 MB and a 400x168 tile is 200 KB, so the pipe carries 3% of the data and the
     Python side never sees a full frame.
+
+    `start` is what stops a resumed run from decoding hours of video it already has
+    parts for. Seeking costs a keyframe of pre-roll and nothing else.
     """
-    return [ffmpeg, "-v", "error", "-nostdin", "-i", str(src),
-            "-vf", f"crop={tile.w}:{tile.h}:{tile.x}:{tile.y}",
-            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    cmd = [ffmpeg, "-v", "error", "-nostdin"]
+    if start and fps is not None:
+        cmd += ["-ss", _seek_arg(start, fps)]
+    return cmd + ["-i", str(src),
+                  "-vf", f"crop={tile.w}:{tile.h}:{tile.x}:{tile.y}",
+                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
 
 
-def _composite_cmd(ffmpeg: str, src: Path, dst: Path, info, tile,
-                   alpha_png: Path, encode: EncodeOpts) -> list[str]:
-    """Overlay the repaired tile stream back onto the untouched source.
+def _seek_arg(start: int, fps: Fraction) -> str:
+    """Where to seek so that frame `start` is the first one out.
 
-    Input 0 is the original (video, audio, metadata), input 1 is our repaired tile
-    arriving on stdin, input 2 is the feather alpha as a still.
+    Half a frame early, deliberately. Input `-ss` is frame-accurate -- ffmpeg seeks
+    to the keyframe before the target and decodes forward, discarding frames whose
+    timestamp is below it -- so the only way to land on the wrong frame is for the
+    target to fall on the boundary and rounding to push it across. Aiming at the
+    midpoint between frame start-1 and frame start leaves half a frame of margin
+    either way, against a value written to microsecond precision. tests/test_resume.py
+    is what proves this lands where it claims: a one-frame error there shows up as a
+    diff between a resumed run and a whole one.
+    """
+    return f"{max(0.0, float((Fraction(start) - Fraction(1, 2)) / fps)):.6f}"
+
+
+def _timescale(fps: Fraction) -> int:
+    """A timebase in which one frame is a whole number of ticks.
+
+    This is not a detail. A part whose duration is stored rounded is a part the
+    concatenator places the next one slightly wrong against, and the error is
+    cumulative: measured, five 12-frame parts written at Matroska's default
+    millisecond resolution came back as 30fps/2.000s from a 30000/1001/2.002s source,
+    because each part lost 0.4ms. Over a feature-length file that is both audio drift
+    and a `frame rate` failure from `wmrm verify`. Ticking at a multiple of the rate's
+    own numerator makes every frame exactly `denominator` ticks, for any rational
+    rate, so nothing is ever rounded.
+    """
+    scale = fps.numerator
+    while scale < 10000:
+        scale *= 10
+    return scale
+
+
+def _part_cmd(ffmpeg: str, src: Path, out: Path, info, tile, alpha_png: Path,
+              encode: EncodeOpts, start: int, count: int) -> list[str]:
+    """Overlay one part's worth of repaired tile onto the untouched source.
+
+    Input 0 is the original, seeked to this part's first frame; input 1 is our
+    repaired tile arriving on stdin; input 2 is the feather alpha as a still.
+
+    Video only. Audio and metadata are attached once at assembly, from the source, so
+    a part carries nothing that has to be reconciled with its neighbours.
     """
     filt = (
         f"[2:v]format=gray,scale={tile.w}:{tile.h}[m];"
         f"[1:v][m]alphamerge[ba];"
         f"[0:v][ba]overlay={tile.x}:{tile.y}:format=auto:shortest=1[out]"
     )
-    cmd = [
-        ffmpeg, "-v", "error", "-nostdin", "-y",
+    cmd = [ffmpeg, "-v", "error", "-nostdin", "-y"]
+    if start:
+        cmd += ["-ss", _seek_arg(start, info.fps)]
+    cmd += [
         "-i", str(src),
         # The tile stream is timed to the source's exact rational rate, not a rounded
         # decimal, or the overlay drifts against the video it sits on.
@@ -355,13 +472,38 @@ def _composite_cmd(ffmpeg: str, src: Path, dst: Path, info, tile,
         "-i", "-",
         "-loop", "1", "-i", str(alpha_png),
         "-filter_complex", filt,
-        "-map", "[out]", "-map", "0:a:0?", "-map_metadata", "0",
+        "-map", "[out]", "-an",
+        # Two independent bounds on the length, because they fail differently:
+        # `shortest=1` ends the graph when our tile stream does, `-frames:v` stops it
+        # even if the graph somehow outlives that.
+        "-frames:v", str(count),
         "-c:v", "libx264", "-crf", str(encode.crf), "-preset", encode.x264_preset,
+        "-pix_fmt", "yuv420p",
+        "-video_track_timescale", str(_timescale(info.fps)),
+        str(out),
+    ]
+    return cmd
+
+
+def _assemble_cmd(ffmpeg: str, listing: Path, src: Path, dst: Path, info,
+                  encode: EncodeOpts) -> list[str]:
+    """Join the parts and put the audio and metadata back, by stream copy.
+
+    Nothing is re-encoded here: the video is already exactly what it will ship as,
+    and the audio has never been touched. On a feature-length 4K file this is minutes
+    of I/O against hours of encoding, which is the whole reason the parts are encoded
+    in their final form rather than as an intermediate.
+    """
+    cmd = [
+        ffmpeg, "-v", "error", "-nostdin", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(listing),
+        "-i", str(src),
         # No -shortest: it ends the file when the shortest stream ends, and an audio
         # track 2.6s shorter than the video silently cost 78 frames off the tail --
-        # the `duration 60.96s vs 58.36s` verify failure. The looped alpha input is
-        # bounded by `shortest=1` on the overlay filter, so the graph still terminates.
-        "-pix_fmt", "yuv420p", "-c:a", "copy",
+        # the `duration 60.96s vs 58.36s` verify failure.
+        "-map", "0:v:0", "-map", "1:a:0?", "-map_metadata", "1",
+        "-c", "copy",
+        "-video_track_timescale", str(_timescale(info.fps)),
     ]
     if encode.faststart:
         cmd += ["-movflags", "+faststart"]
@@ -387,6 +529,199 @@ class _Stage(threading.Thread):
             self._fn()
         except BaseException as exc:            # noqa: BLE001 -- re-raised by caller
             self.error = exc
+
+
+def _fingerprint(src: Path, info, region, opts, encode, part_frames: int) -> dict:
+    """What has to match for parts from an earlier run to still be usable.
+
+    Everything that decides an output pixel, and nothing that does not. The source is
+    identified by size and mtime rather than by a content hash: hashing 15 GB to
+    answer "is this the same file" costs minutes on every resume, and the only case it
+    catches beyond this is someone substituting a different file of exactly the same
+    size at exactly the same mtime.
+
+    Note what is *in* here. `segment` and `overlap` change which frames the model sees
+    together and therefore change pixels, so a resume with a different segment size is
+    refused rather than silently producing a video whose halves were made differently.
+    That is also why a resumed run reuses the recorded segment instead of asking
+    `auto_segment` again -- free VRAM at startup is not a property of the video.
+    """
+    st = src.stat()
+    b, t = region.box, region.tile
+    return {
+        "version": MANIFEST_VERSION,
+        "source": {"name": src.name, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                   "nframes": info.nframes, "fps": str(info.fps),
+                   "frame": [info.width, info.height]},
+        "region": {"box": [b.x, b.y, b.w, b.h], "tile": [t.x, t.y, t.w, t.h]},
+        "model": {"segment": opts.segment, "overlap": opts.overlap,
+                  "subvideo_length": opts.subvideo_length,
+                  "neighbor_length": opts.neighbor_length,
+                  "ref_stride": opts.ref_stride, "raft_iter": opts.raft_iter,
+                  "mask_dilation": opts.mask_dilation, "fp16": bool(opts.fp16),
+                  "scene_threshold": opts.scene_threshold, "min_shot": opts.min_shot},
+        "encode": {"crf": encode.crf, "preset": encode.x264_preset},
+        "part_frames": part_frames,
+    }
+
+
+def _read_manifest(parts_dir: Path) -> dict | None:
+    """The record left by an earlier run, or None if there is nothing to trust.
+
+    Unreadable, malformed and written-by-another-version all mean the same thing here
+    -- start over -- because the alternative is guessing at what half a manifest meant.
+    """
+    try:
+        data = json.loads((parts_dir / MANIFEST).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("fingerprint", {}).get("version") != MANIFEST_VERSION:
+        return None
+    return data
+
+
+def _part_length(path: Path) -> int:
+    """Frames in a finished part, counted from the container, not by decoding.
+
+    `-count_packets` reads the packet headers only: for H.264 one packet is one
+    frame, and a 3600-frame 4K part answers in well under a second. This is what
+    makes a part trustworthy -- the frames are counted in the file that shipped them,
+    not in the pipe that fed it.
+    """
+    _, ffprobe = require_tools()
+    res = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True)
+    if res.returncode != 0:
+        return -1
+    try:
+        return int(res.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return -1
+
+
+def _usable_parts(parts_dir: Path, total: int, part_frames: int, say) -> int:
+    """How many frames at the head of the video are already composited on disk.
+
+    The longest *unbroken* prefix of complete parts, and only that. A part with the
+    wrong frame count ends the prefix rather than being repaired: it is either the
+    one the crash interrupted or evidence that something else is wrong, and in both
+    cases the cheap, correct answer is to make it again. Parts after a gap are
+    discarded for the same reason -- keeping them would mean trusting that the gap is
+    the only thing missing.
+    """
+    done = 0
+    for index in range(0, (total + part_frames - 1) // part_frames):
+        path = parts_dir / PART_NAME.format(index)
+        if not path.exists():
+            break
+        want = min(part_frames, total - index * part_frames)
+        got = _part_length(path)
+        if got != want:
+            say(f"[pp] resume: {path.name} holds {got} frames, expected {want} -- "
+                f"redoing it and everything after")
+            break
+        done += 1
+    keep = done * part_frames
+    for stale in sorted(parts_dir.glob(PART_GLOB))[done:]:
+        stale.unlink(missing_ok=True)
+    return min(keep, total)
+
+
+class _PartSink:
+    """Composites repaired tile frames into fixed-size, self-contained parts.
+
+    One ffmpeg per part, seeked to that part's first frame. A part on disk with the
+    right frame count is finished for good, so the next run starts at the first frame
+    that has no part -- which is the whole of the resume mechanism.
+
+    It also removes the failure this replaced. The compositor used to be a single
+    ffmpeg fed for nine hours, and anything that killed it, or killed the pipe into
+    it, discarded every frame it had encoded.
+    """
+
+    def __init__(self, *, ffmpeg: str, src: Path, parts_dir: Path, info, tile,
+                 alpha_png: Path, encode: EncodeOpts, total: int, part_frames: int,
+                 first: int, say) -> None:
+        self.ffmpeg, self.src, self.parts_dir = ffmpeg, src, parts_dir
+        self.info, self.tile, self.alpha_png = info, tile, alpha_png
+        self.encode, self.total, self.part_frames = encode, total, part_frames
+        self.say = say
+        self.index = first          # absolute index of the next frame to write
+        self.written = 0            # frames written by this run, for the stall watch
+        self.parts: list[tuple[int, int]] = []   # (part index, frames written)
+        self._proc: subprocess.Popen | None = None
+        self._part = -1
+        self._count = 0
+
+    def write(self, frame) -> None:
+        part = self.index // self.part_frames
+        if part != self._part:
+            self.close()
+            self._open(part)
+        assert self._proc is not None and self._proc.stdin is not None
+        self._proc.stdin.write(frame.data)       # .data: no tobytes() copy
+        self.index += 1
+        self.written += 1
+        self._count += 1
+
+    def _open(self, part: int) -> None:
+        start = part * self.part_frames
+        want = min(self.part_frames, max(0, self.total - start)) or self.part_frames
+        out = self.parts_dir / PART_NAME.format(part)
+        self._proc = subprocess.Popen(
+            _part_cmd(self.ffmpeg, self.src, out, self.info, self.tile,
+                      self.alpha_png, self.encode, start, want),
+            stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        self._part, self._count = part, 0
+
+    def close(self) -> None:
+        """Finish the open part and prove it holds what was fed into it."""
+        if self._proc is None:
+            return
+        proc, part, count = self._proc, self._part, self._count
+        self._proc, self._part, self._count = None, -1, 0
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        err = drain(proc.stderr)
+        proc.wait()
+        path = self.parts_dir / PART_NAME.format(part)
+        if proc.returncode != 0:
+            raise EncodeError(f"compositing {path.name} failed (exit "
+                              f"{proc.returncode}) after {count} frames:\n"
+                              f"{err.strip()[:800]}")
+        got = _part_length(path)
+        if got != count:
+            raise EncodeError(f"{path.name} holds {got} frames but {count} were "
+                              f"written into it; refusing to build a video out of "
+                              f"parts that do not hold what they were given\n"
+                              f"{err.strip()[:400]}")
+        self.parts.append((part, count))
+
+    def abandon(self) -> None:
+        """Drop the part being written. Called when the run is already failing.
+
+        The open part is incomplete by definition, and an incomplete part that looks
+        finished is the one thing a resume must never find.
+        """
+        if self._proc is None:
+            return
+        proc, part = self._proc, self._part
+        self._proc, self._part, self._count = None, -1, 0
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        drain(proc.stderr)
+        proc.wait()
+        (self.parts_dir / PART_NAME.format(part)).unlink(missing_ok=True)
 
 
 def _decode_frames(stream, tile):
@@ -676,6 +1011,7 @@ def run_propainter(
     opts: ProPainterOpts,
     encode: EncodeOpts | None = None,
     progress: bool = True,
+    resume: bool = False,
 ) -> Region:
     ffmpeg, _ = require_tools()
     encode = encode or EncodeOpts()
@@ -688,8 +1024,22 @@ def run_propainter(
     tile = region.tile
     say = (lambda m: print(m, file=sys.stderr, flush=True)) if progress else (lambda m: None)
 
+    parts_dir = dst.with_name(dst.name + ".parts")
+    prior = _read_manifest(parts_dir) if resume else None
+    if resume and prior is None:
+        say(f"[pp] resume: nothing usable in {parts_dir.name}/ -- starting from the "
+            f"beginning")
+
     hw = _hardware()
-    if opts.segment is None:
+    if prior is not None and opts.segment is None:
+        # Segment size decides which frames the model sees together, so it decides
+        # pixels. Asking `auto_segment` again would answer from whatever VRAM happens
+        # to be free now, and the second half of the video would be made differently
+        # from the first. The recorded value is the one the parts on disk were made
+        # with, so it is the only correct answer here.
+        segment = int(prior["fingerprint"]["model"]["segment"])
+        say(f"[pp] segment {segment} frames, taken from the run being resumed")
+    elif opts.segment is None:
         segment, why = auto_segment(tile.w * tile.h, hw, opts.overlap)
         say(f"[pp] hardware: {hw['cpu']} cpu, {_sizeof(hw['ram_total'])} RAM"
             + (f", {hw['gpu']} {_sizeof(hw['vram_total'])}" if hw["gpu"] else ", no GPU"))
@@ -723,12 +1073,21 @@ def run_propainter(
     # the result changes -- it is the same filter over the same frames -- so this is a
     # speed decision only, and _shot_starts falls back on its own if the card refuses.
     use_nvdec = bool(hw["gpu"]) and opts.device != "cpu"
-    if opts.scene_threshold > 0:
-        say(f"[pp] scanning for scene cuts ({info.nframes or '?'} frames to decode, "
-            f"the one step here that is pure decode)"
-            + (" -- via NVDEC" if use_nvdec else " -- on the CPU"))
-    shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps),
-                               hwaccel=use_nvdec, say=say)
+    if prior is not None and prior.get("cuts") is not None:
+        # Detection is a whole extra decode of the source -- ~9 minutes for a 2.6-hour
+        # film on NVDEC, ~43 on the CPU -- to answer a question about a file that has
+        # not changed since the last run answered it. The fingerprint covers the
+        # source and the threshold, so a matching manifest means the same cuts.
+        shot_starts = [int(c) for c in prior["cuts"]]
+        say(f"[pp] resume: reusing {len(shot_starts)} scene cut(s) from the manifest "
+            f"instead of decoding the source again to find them")
+    else:
+        if opts.scene_threshold > 0:
+            say(f"[pp] scanning for scene cuts ({info.nframes or '?'} frames to "
+                f"decode, the one step here that is pure decode)"
+                + (" -- via NVDEC" if use_nvdec else " -- on the CPU"))
+        shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps),
+                                   hwaccel=use_nvdec, say=say)
     _plan_est_total = info.nframes or (1 << 30)
     plan = _segment_plan(shot_starts, _plan_est_total, opts.segment, opts.overlap,
                          opts.min_shot)
@@ -738,25 +1097,57 @@ def run_propainter(
             f"(threshold {opts.scene_threshold})")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
+    n_total = info.nframes or 0
+    fp = _fingerprint(src, info, region, opts, encode, opts.part_frames)
+    if prior is not None and prior.get("fingerprint") != fp:
+        was = prior.get("fingerprint", {})
+        changed = [k for k, v in fp.items() if was.get(k) != v]
+        say(f"[pp] resume: the parts in {parts_dir.name} were made with different "
+            f"settings ({', '.join(changed)}) -- starting from the beginning")
+        prior = None
+
+    if prior is None:
+        for stale in parts_dir.glob(PART_GLOB):
+            stale.unlink(missing_ok=True)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    (parts_dir / MANIFEST).write_text(
+        json.dumps({"fingerprint": fp, "cuts": shot_starts}, indent=1))
+
+    # Where this run has to pick up: the first frame with no finished part behind it.
+    resume_from = _usable_parts(parts_dir, n_total, opts.part_frames, say) if prior else 0
+    # The model restarts at the beginning of the segment that frame belongs to, not at
+    # the frame itself. A segment is a pure function of the source frames it spans --
+    # `hist` carries decoded frames, never repaired ones -- so recomputing the part of
+    # it that is already on disk reproduces it exactly, and starting mid-segment would
+    # not: the model would be given a different block and would answer differently.
+    seg0, dec_start, pos0 = 0, 0, 0
+    if resume_from:
+        for i, (s_abs, e_abs, lcap, _r) in enumerate(plan):
+            if s_abs <= resume_from < e_abs:
+                seg0, dec_start, pos0 = i, max(0, s_abs - lcap), s_abs
+                break
+        else:
+            seg0, dec_start, pos0 = len(plan), resume_from, resume_from
+        say(f"[pp] resume: {resume_from} of {n_total or '?'} frames already composited; "
+            f"restarting the model at segment {seg0 + 1}/{len(plan)}, frame {pos0}"
+            + (f" (redoing {resume_from - pos0} frame(s) that a part already holds, "
+               f"because a segment is only reproducible whole)" if resume_from > pos0
+               else ""))
+
     with tempfile.TemporaryDirectory(prefix="wmrm-pp-") as td:
         work = Path(td)
-        # The only two files this path writes. Everything else stays in memory.
+        # The only file this path writes outside the parts directory. Everything else
+        # stays in memory.
         alpha_png = work / "alpha.png"
         cv2.imwrite(str(alpha_png), (region.alpha[:, :, 0] * 255).astype(np.uint8))
 
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            dir=dst.parent, prefix=f".{dst.stem}.", suffix=dst.suffix or ".mp4")
-        os.close(tmp_fd)
-        tmp = Path(tmp_name)
-
-        dec = subprocess.Popen(_decode_cmd(ffmpeg, src, tile),
+        dec = subprocess.Popen(_decode_cmd(ffmpeg, src, tile, dec_start, info.fps),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                bufsize=0)
-        enc = subprocess.Popen(_composite_cmd(ffmpeg, src, tmp, info, tile,
-                                              alpha_png, encode),
-                               stdin=subprocess.PIPE, stderr=subprocess.PIPE,
-                               bufsize=0)
-        assert dec.stdout is not None and enc.stdin is not None
+        assert dec.stdout is not None
+        sink = _PartSink(ffmpeg=ffmpeg, src=src, parts_dir=parts_dir, info=info,
+                         tile=tile, alpha_png=alpha_png, encode=encode, total=n_total,
+                         part_frames=opts.part_frames, first=resume_from, say=say)
 
         # Bounded queues are the backpressure. One segment of lookahead on each side
         # is enough to keep every stage busy; more would only raise peak memory.
@@ -778,16 +1169,12 @@ def run_propainter(
             finally:
                 q_in.put(DONE)
 
-        written = 0
-
         def pump_encode() -> None:
-            nonlocal written
             while True:
                 item = q_out.get()
                 if item is DONE:
                     return
-                enc.stdin.write(item.data)      # .data: no tobytes() copy
-                written += 1
+                sink.write(item)
 
         t_decode = _Stage(pump_decode, "wmrm-decode")
         t_encode = _Stage(pump_encode, "wmrm-encode")
@@ -818,18 +1205,32 @@ def run_propainter(
                 except queue.Full:
                     continue
 
-        n = 0                  # frames read
-        emitted = 0            # frames handed to the compositor
+        n = 0                  # frames read by this run
+        emitted = 0            # frames handed to the compositor by this run
+        pos = pos0             # absolute index of buf[0] -- not `emitted`, which on a
+                               # resumed run starts counting again from zero
         nonfinite_total = 0
         nonfinite_at: set[int] = set()
         model_frames = 0       # frames the model actually ran on, context included
         n_seg = 0
         eof = False
-        hist: list[np.ndarray] = []      # last `overlap` emitted frames, for left context
-        buf: list[np.ndarray] = []       # decoded, not yet emitted; buf[0] is frame `emitted`
+        hist: list[np.ndarray] = []      # last `overlap` decoded frames, for left context
+        buf: list[np.ndarray] = []       # decoded, not yet emitted; buf[0] is frame `pos`
         t_model = 0.0
         est_total = info.nframes or 0
         broken = False
+        crash: BaseException | None = None
+
+        # A resumed run decodes from `dec_start` rather than from zero, and the frames
+        # between there and the first segment body are exactly that segment's left
+        # context -- the ones a whole run would have had in `hist` by now.
+        while len(hist) < pos0 - dec_start:
+            f = next_frame()
+            if f is None:
+                eof = True
+                break
+            hist.append(f)
+            n += 1
 
         if shot_starts:
             lens = [e - s for s, e, _, _ in plan]
@@ -840,7 +1241,7 @@ def run_propainter(
                 f"{opts.segment}")
 
         try:
-            for seg_i, (s_abs, e_abs, lcap, rcap) in enumerate(plan):
+            for seg_i, (s_abs, e_abs, lcap, rcap) in enumerate(plan[seg0:], seg0):
                 if eof and not buf:
                     break
                 # Frames still needed: this body, plus its right-hand context. Those
@@ -866,9 +1267,9 @@ def run_propainter(
 
                 block = left + body + ahead
                 n_seg += 1
-                say(f"[pp] segment {n_seg}/{len(plan)}: frames {s_abs}-{s_abs + body_len - 1} "
+                say(f"[pp] segment {seg_i + 1}/{len(plan)}: frames {s_abs}-{s_abs + body_len - 1} "
                     f"(+{len(left)}/{len(ahead)} context)"
-                    + (f", {n}/{est_total} decoded" if est_total else ""))
+                    + (f", {dec_start + n}/{est_total} decoded" if est_total else ""))
 
                 ts = time.monotonic()
                 out = _inpaint_or_split(worker, block, region.inpaint_mask, say)
@@ -881,10 +1282,9 @@ def run_propainter(
                 bad = getattr(worker, "nonfinite", 0)
                 if bad:
                     frames_hit = sorted(getattr(worker, "nonfinite_frames", ()))
-                    # `emitted` is the absolute index of body[0]: it counts frames
-                    # already sent, and body[0] is the next one to send. Block index i
-                    # therefore sits at emitted - len(left) + i.
-                    absolute = [emitted - len(left) + i for i in frames_hit]
+                    # `pos` is the absolute index of body[0], so block index i sits at
+                    # pos - len(left) + i.
+                    absolute = [pos - len(left) + i for i in frames_hit]
                     nonfinite_total += bad
                     nonfinite_at.update(absolute)
                     say(f"[pp]   WARNING the model produced {bad} non-finite value(s) "
@@ -902,14 +1302,20 @@ def run_propainter(
                         f"{tile.w}x{tile.h}")
 
                 # Emit only the body, in order. Frame j is produced by exactly one
-                # segment, so ordering here is positional and not a race.
+                # segment, so ordering here is positional and not a race. On a resumed
+                # run the head of this segment is already in a finished part; it was
+                # recomputed to make the rest of the segment reproducible, and it is
+                # dropped here rather than written twice.
                 for i in range(len(left), len(left) + len(body)):
+                    if pos + (i - len(left)) < resume_from:
+                        continue
                     emit(np.ascontiguousarray(out[i]))
                     emitted += 1
+                pos += body_len
 
                 el = time.monotonic() - t_start
                 rate = emitted / max(t_model, 1e-6)
-                eta = ((est_total - emitted) / rate) if rate and est_total > emitted else 0.0
+                eta = ((est_total - pos) / rate) if rate and est_total > pos else 0.0
                 say(f"[pp]   {_hms(time.monotonic() - ts)}  "
                     f"{rate:.2f} fps model" + (f"  eta {_hms(eta)}" if eta else "")
                     + f"  elapsed {_hms(el)}")
@@ -950,21 +1356,48 @@ def run_propainter(
                 t_model += time.monotonic() - ts
                 model_frames += len(left) + body_len + ahead_len
                 for i in range(len(left), len(left) + body_len):
+                    if pos + (i - len(left)) < resume_from:
+                        continue
                     emit(np.ascontiguousarray(out[i]))
                     emitted += 1
+                pos += body_len
                 if opts.overlap:
                     hist = (hist + body)[-opts.overlap:]
                 buf = buf[body_len:]
         except BrokenPipeError:
             broken = True
+        except BaseException as exc:            # noqa: BLE001 -- re-raised below
+            # Held rather than propagated, so that the compositor is still shut down
+            # and the open part still abandoned. Letting it fly from here would skip
+            # both: an OOM in the model would leave a half-written part on disk with
+            # nothing to mark it unfinished, and the next --resume would read it as
+            # done and build a video with a gap in it. tests/test_resume.py pins this.
+            crash = exc
         finally:
             q_out.put(DONE)
-            t_encode.join(timeout=60)
-            try:
-                if enc.stdin and not enc.stdin.closed:
-                    enc.stdin.close()
-            except BrokenPipeError:
-                broken = True
+            # Wait on *progress*, not on a fixed deadline. The last segment hands its
+            # whole body over at once -- up to `segment` frames -- and the model is
+            # idle from that moment on, so the flush is minutes of encoding with
+            # nothing left to overlap it against. A flat 60s deadline expired
+            # mid-flush: main closed the pipe underneath the writer thread and the
+            # frames still queued were counted as missing, which failed the run after
+            # nine hours of model time. Measured twice at 4K, where the compositor
+            # runs around 22-23 fps: a 1417-frame final segment came up 4 frames
+            # short, a 1387-frame one 50 short -- both exactly `body - 60s * rate`.
+            # Shorter final segments cleared the deadline, which is why this looked
+            # like it depended on the file rather than on where the last cut fell.
+            # A thread that is still moving frames is not a stuck thread.
+            stalled = 0.0
+            while t_encode.is_alive():
+                mark = sink.written
+                t_encode.join(timeout=STALL_POLL)
+                if sink.written != mark:
+                    stalled = 0.0
+                    continue
+                stalled += STALL_POLL
+                if stalled >= STALL_LIMIT:
+                    break
+            encode_stuck = t_encode.is_alive()
 
             # Order matters. Reading the decoder's stderr waits for EOF, which only
             # arrives when it exits -- and it cannot exit while it is blocked writing
@@ -973,31 +1406,57 @@ def run_propainter(
                 dec.kill()
             dec_err = drain(dec.stderr)
             dec.wait()
-            enc_err = drain(enc.stderr)
-            enc.wait()
 
-        if t_decode.error is not None:
-            tmp.unlink(missing_ok=True)
-            raise ProPainterError(f"decoding the tile failed: {t_decode.error}\n"
-                                  f"{dec_err.strip()[:800]}")
-        if broken:
-            tmp.unlink(missing_ok=True)
-            raise EncodeError("the compositing ffmpeg exited while frames were still "
-                              f"being written:\n{enc_err.strip()[:800]}")
-        if n == 0:
-            tmp.unlink(missing_ok=True)
-            raise ProPainterError(f"decoded 0 tile frames from {src}\n"
-                                  f"{dec_err.strip()[:600]}")
-        if written != n:
-            tmp.unlink(missing_ok=True)
-            raise ProPainterError(
-                f"wrote {written} frames but decoded {n}; refusing to ship a video "
-                "with frames missing or duplicated")
-        if enc.returncode != 0:
-            tmp.unlink(missing_ok=True)
-            raise EncodeError(f"compositing failed:\n{enc_err.strip()[:800]}")
+        # Anything raised from here abandons the part still being written: it is
+        # incomplete by definition, and an incomplete part that looks finished is the
+        # one thing a resume must never find.
+        try:
+            if crash is not None:
+                raise crash
+            if t_decode.error is not None:
+                raise ProPainterError(f"decoding the tile failed: {t_decode.error}\n"
+                                      f"{dec_err.strip()[:800]}")
+            if broken:
+                raise EncodeError("a compositing ffmpeg exited while frames were "
+                                  "still being written into it")
+            # Causes before symptoms. A frame-count mismatch is what you notice, but
+            # it is also what a stuck compositor and a dead writer thread both look
+            # like from here, and reporting the count first left ffmpeg's own message
+            # unread while the run died of something else.
+            if encode_stuck:
+                raise EncodeError(
+                    f"the compositing ffmpeg accepted no frames for "
+                    f"{_hms(STALL_LIMIT)}, with {emitted - sink.written} still "
+                    f"queued; giving up")
+            if t_encode.error is not None:
+                raise t_encode.error
+            if n == 0 and not resume_from:
+                raise ProPainterError(f"decoded 0 tile frames from {src}\n"
+                                      f"{dec_err.strip()[:600]}")
+            if sink.written != emitted:
+                raise EncodeError(f"{emitted} frames were handed to the compositor "
+                                  f"but {sink.written} reached it")
+            sink.close()
+            # The invariant the old `written != n` check was reaching for, stated
+            # where it is actually true: every frame decoded from the source has one
+            # frame in the parts, counted in absolute positions so that it means the
+            # same thing on a resumed run as on a whole one.
+            if sink.index != dec_start + n:
+                raise ProPainterError(
+                    f"the parts hold {sink.index} frames but {dec_start + n} were "
+                    f"decoded; refusing to ship a video with frames missing or "
+                    f"duplicated")
+        except BaseException:
+            sink.abandon()
+            say(f"[pp] {resume_from + emitted} frame(s) are composited and kept in "
+                f"{parts_dir.name}/. Re-run the same command with --resume to carry "
+                f"on from there instead of from the beginning.")
+            raise
 
+        tmp = _join_parts(ffmpeg, parts_dir, work, src, dst, info, encode,
+                          sink.index, say)
         os.replace(tmp, dst)          # atomic
+        shutil.rmtree(parts_dir, ignore_errors=True)
 
     total = time.monotonic() - t_start
     if nonfinite_total:

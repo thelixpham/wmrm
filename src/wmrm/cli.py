@@ -162,6 +162,7 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
             dilate_px=preset.dilate_px, feather_px=preset.feather_px,
             margin_px=preset.margin_px, encode=encode,
             progress=not args.quiet,
+            resume=args.resume,
             # --device now reaches this path. It used to be accepted and silently
             # ignored here: upstream's script has no device flag, so a CUDA box that
             # failed the cudnn check fell back to CPU without saying so, at ~400x the
@@ -169,6 +170,7 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
             opts=ProPainterOpts(repo=find_repo(args.propainter),
                                 device=args.device,
                                 segment=args.pp_segment,
+                                part_frames=args.pp_part,
                                 subvideo_length=args.pp_subvideo,
                                 raft_iter=args.raft_iter,
                                 fp16=not args.no_fp16,
@@ -674,6 +676,23 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                         "with its reasoning. Segments also stop at scene cuts, so most "
                         "are shorter. Pin a number to reproduce a run or to bisect an "
                         "out-of-memory failure")
+    p.add_argument("--resume", action="store_true",
+                   help="carry on from where a killed run stopped, instead of "
+                        "starting again. The video is composited in parts of "
+                        "--pp-part frames next to the output; a run that dies leaves "
+                        "the finished ones behind, and this reuses every part whose "
+                        "frame count checks out. Also reuses the recorded scene cuts "
+                        "and segment size, so the second half of a video is never "
+                        "made with different settings from the first. Refuses to "
+                        "resume, and starts over instead, if the source or any "
+                        "setting that decides a pixel has changed")
+    p.add_argument("--pp-part", type=int, default=3600,
+                   help="frames per composited part (default 3600, two minutes at "
+                        "30fps). This is what a crash costs you: at most one part of "
+                        "model time and encoding. Output is identical whatever it is "
+                        "set to -- parts are cut on a fixed grid, not on the model's "
+                        "segments -- so it trades restart granularity against the "
+                        "per-part ffmpeg startup")
     p.add_argument("--pp-scene-threshold", type=float, default=0.3,
                    help="ffmpeg scene score above which a frame starts a new shot "
                         "(default 0.3). Segments never span a cut, because the model "

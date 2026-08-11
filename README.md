@@ -72,6 +72,14 @@ wmrm batch ./inbox --detect            # detect once, apply to the folder
 wmrm run clip.mp4 --detect             # one file
 ```
 
+```bash
+export R2_ACCOUNT_ID=...  R2_ACCESS_KEY_ID=...  R2_SECRET_ACCESS_KEY=...
+export R2_BUCKET=remove-watermark
+
+wmrm pull --stat uploads/3d809a59-3e5c-4977-9dd6-bbc15b4f58d6/MOGI-125.mp4
+wmrm pull uploads/dca49130-7a17-4cb5-9cde-9390efd6d590/MOGI-119.mp4
+```
+
 It detects **once** on the first file, applies that box to the whole folder, and
 writes a preview PNG next to it. **Look at that preview afterwards** — detection is
 a guess with real failure modes (see below), and this is the only thing standing
@@ -257,6 +265,26 @@ uv pip install --index-url https://download.pytorch.org/whl/cpu torch
 uv pip install --index-url https://download.pytorch.org/whl/cu124 torch
 ```
 
+**On a Blackwell card (RTX 50-series, RTX PRO Blackwell) `cu124` is not enough.**
+Those are compute capability `sm_120`, and a cu124 build stops at `sm_90`, so it
+installs cleanly, reports `cuda (…)` in the banner, loads the models — and then
+dies at the first kernel launch with `no kernel image is available for execution
+on the device`. Use a newer index:
+
+```bash
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+```
+
+Verify before running anything, because every symptom above is identical either
+way until the first kernel launch:
+
+```bash
+python -c "import torch; print(torch.cuda.get_arch_list())"   # must contain sm_120
+```
+
+If it does not, try `cu130`. `torch` and `torchvision` must come from the **same**
+index — see the warning under `--quality video`.
+
 **Step 2 — the rest.** Identical on both:
 
 ```bash
@@ -265,6 +293,9 @@ uv pip install "pillow>=10" opencv-python-headless numpy
 uv pip install --no-deps -e .
 source .venv/bin/activate
 ```
+
+Pulling sources from R2 (`wmrm pull`)? Add `boto3` — either `uv pip install
+boto3`, or `uv pip install -e '.[r2]'` to go through the extra.
 
 Then confirm, **in the shell you will actually use**:
 
@@ -291,8 +322,18 @@ check quick; leave it off for real work.
 
 Install notes, all deliberate:
 
-- `simple-lama-inpainting` needs `--no-deps`: it pins `pillow==9.5`, which does
-  not build on Python 3.12.
+- `simple-lama-inpainting` needs `--no-deps`: it declares `pillow<10`, which does
+  not build on Python 3.12. It also declares `numpy<2` and `opencv-python<5`, and
+  none of the three bounds reflect what its code needs — measured, LaMa imports
+  and runs here under pillow 12.2, numpy 2.4 and opencv-python-headless 5.0.
+  `[tool.uv] override-dependencies` in `pyproject.toml` says so, which is what
+  lets any command that resolves the project properly (`uv pip install -e '.[r2]'`,
+  say) succeed instead of reporting an unsatisfiable conflict. The `--no-deps`
+  above is still the shortest path, and the override is what makes dropping it
+  possible.
+- That override *drops* `opencv-python` rather than relaxing it, because it and
+  `opencv-python-headless` both ship `cv2`: with both installed the import order
+  decides which one you get.
 - Installing into an environment that already had torch? Drop `numpy` from step 2
   — pulling in numpy 2.x next to a torch built against 1.x breaks the ABI.
 - LaMa weights (`big-lama.pt`, 196 MB) download on first use to
@@ -310,8 +351,52 @@ Install notes, all deliberate:
 | `wmrm run IN [-o OUT]` | process one video. Default output `IN-clean.EXT`. |
 | `wmrm batch DIR` | process every video in a directory, skipping finished ones. |
 | `wmrm verify ORIG OUT` | re-run the acceptance checks on an existing pair. |
+| `wmrm pull KEY` | download a source video from Cloudflare R2. Resumable. |
 
 `run` and `batch` need either `--preset` or `--box`.
+
+### Getting the file — `wmrm pull`
+
+Needs `boto3`: `uv pip install -e '.[r2]'`. Credentials from the environment,
+nothing is read from the repo:
+
+```sh
+export R2_ACCOUNT_ID=...            # or R2_ENDPOINT for a custom domain
+export R2_ACCESS_KEY_ID=...
+export R2_SECRET_ACCESS_KEY=...
+export R2_BUCKET=remove-watermark
+
+wmrm pull --stat uploads/3d809a59-.../MOGI-125.mp4         # size first
+wmrm pull uploads/3d809a59-.../MOGI-125.mp4 -o work/       # then fetch
+```
+
+Then the normal commands, on a local file, unchanged:
+
+```sh
+wmrm grid work/MOGI-125.mp4 --corner tr
+wmrm coverage work/MOGI-125.mp4 --box X,Y,W,H
+wmrm run work/MOGI-125.mp4 --box X,Y,W,H
+```
+
+This is a separate step rather than a `r2://` URI that `run` accepts, and that
+is deliberate at the sizes here. A 22–100 GB transfer is hours; the processing
+after it is hours more and is *not* resumable. Fused into one command, a run
+that dies on a bad box throws the download away with it.
+
+**It resumes.** 64 MiB chunks are fetched by 8 parallel ranged GETs into a
+preallocated `.part`, and the chunks that landed are recorded in a sidecar
+JSON. Re-run the identical command after a dropped connection or a Ctrl-C and
+it picks up — which matters, because at 100 GB a transfer that can only start
+from zero is a transfer that may never finish. If the object changed on R2
+(different size or etag) the local bytes are no longer a prefix of it, so the
+part file is discarded rather than silently producing a corrupt mix.
+
+`--workers` past 8 only helps until the link or the disk saturates; the
+progress line reports the achieved rate, so compare rather than guess. Free
+space is checked before the first byte, not discovered at 90 GB.
+
+`wmrm pull --list uploads/` lists keys under a prefix when you only half
+remember one.
 
 ### Options you may actually need
 
@@ -465,6 +550,59 @@ Four things this wrapper does that matter:
 
 Overlap between segments is still discarded on both sides, so the model always has
 temporal context either side of every frame that is kept and the joins do not show.
+
+#### Scene detection decodes the whole file first
+
+Before any frame is processed, one ffmpeg pass scores every frame against its
+predecessor to find the cuts, so no segment ever spans one. On a feature-length
+input that pass is long and silent — the run looks hung after `models loaded`,
+and the next line only appears when it finishes. It now says what it is doing
+and which decoder it is using.
+
+**It decodes through NVDEC when there is a CUDA card.** This is the only step
+where decode is the entire cost rather than ~7% of it, and `select='gt(scene,…)'`
+is serial by nature — each frame is scored against the one before it — so extra
+cores do not help. Measured on a 128-core EPYC, the CPU path pinned **1.8 cores
+and left 126 idle**. Measured on 120 s of 1080p with a 4090:
+
+| | wall | CPU time | cuts found |
+| --- | --- | --- | --- |
+| CPU decode | 32.9 s | 54.0 s | 4 |
+| NVDEC (`-hwaccel cuda`) | **6.8 s** | **3.0 s** | 4 |
+
+4.8× on the clock, 18× less CPU, same answer — roughly **43 min → 9 min** on a
+2.6-hour film. If the card refuses the file (NVDEC rejects some profiles and bit
+depths) it falls back to the CPU and says so, rather than just running 5× slower
+for no stated reason. `--device cpu` opts out.
+
+**Everything else was measured and rejected.** The reason none of it worked is one
+number: against a decode-only null sink, the scene filter accounts for **7% of the
+pass**. The other 93% is decoding. Nothing that optimises the filter can matter,
+and nothing that decodes every frame can win — which leaves moving the decode off
+the CPU, i.e. NVDEC.
+
+| approach | result | why it fails |
+| --- | --- | --- |
+| `scdet` filter instead of `select` | 1.00× | same cost to the frame; with `sc_pass=1` it also found 5 of 23 cuts |
+| downscale before the filter (PySceneDetect's advice) | 0.8× | ffmpeg still decodes at full resolution, so the scale is pure added work |
+| split the timeline across parallel ffmpegs | 1.2× | identical cuts (`-copyts` keeps timestamps absolute), but cores were never the constraint — the serial pass already used 4.3 of 6 |
+| keyframe index for candidates, decode only to confirm | 1.05× at best | see below |
+
+The last one deserves its epitaph, because it looks like it should work. Every real
+cut *is* a keyframe (encoders force an IDR at a scenecut) and the container index
+lists them without decoding anything — 0.07s against 4.80s. But keyframes are a
+superset, so each candidate still needs a seek and a short decode to confirm, and
+that cost scales with the file exactly as fast as full decode does. Measured on a
+40-minute fixture across keyframe densities: 0.74× at one keyframe per 2s, and
+1.05× at the theoretical floor where every keyframe already *is* a cut and there is
+nothing left to reject. 5% is not worth a dependency on how the input was encoded.
+
+All of these produced the correct cuts. They were rejected on speed alone.
+
+A failed decode here now raises. It used to return an empty cut list, which is
+indistinguishable from a clean scan that found nothing: the run would report "no
+scene cuts found", plan fixed segments, and silently lose the protection this
+pass exists to provide.
 
 ### Which `--quality`, and how long it takes
 
