@@ -693,16 +693,25 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                         "with its reasoning. Segments also stop at scene cuts, so most "
                         "are shorter. Pin a number to reproduce a run or to bisect an "
                         "out-of-memory failure")
-    p.add_argument("--resume", action="store_true",
-                   help="carry on from where a killed run stopped, instead of "
-                        "starting again. The video is composited in parts of "
-                        "--pp-part frames next to the output; a run that dies leaves "
-                        "the finished ones behind, and this reuses every part whose "
-                        "frame count checks out. Also reuses the recorded scene cuts "
-                        "and segment size, so the second half of a video is never "
-                        "made with different settings from the first. Refuses to "
-                        "resume, and starts over instead, if the source or any "
+    # On by default, and the asymmetry is the point. Off by default, the failure mode
+    # is "you forgot a flag, so nine hours of finished parts were deleted before you
+    # could read the message" -- silent, unrecoverable, and only visible afterwards.
+    # On by default, the failure mode is "it reused work it should not have", and
+    # that one cannot happen: the manifest fingerprints the source and every setting
+    # that decides a pixel, and a mismatch starts over on its own and says so.
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="(the default) carry on from where a killed run stopped. The "
+                        "video is composited in parts of --pp-part frames next to the "
+                        "output; a run that dies leaves the finished ones behind, and "
+                        "this reuses every part whose frame count checks out. Also "
+                        "reuses the recorded scene cuts and segment size, so the "
+                        "second half of a video is never made with different settings "
+                        "from the first. Starts over on its own if the source or any "
                         "setting that decides a pixel has changed")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="delete any finished parts and start from frame zero. Only "
+                        "needed to discard work the fingerprint would have accepted -- "
+                        "a changed input or setting is already detected on its own")
     p.add_argument("--pp-part", type=int, default=3600,
                    help="frames per composited part (default 3600, two minutes at "
                         "30fps). This is what a crash costs you: at most one part of "
