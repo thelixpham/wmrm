@@ -494,7 +494,6 @@ def _part_cmd(ffmpeg: str, src: Path, out: Path, info, tile, alpha_png: Path,
         "-c:v", "libx264", "-crf", str(encode.crf), "-preset", encode.x264_preset,
         "-pix_fmt", "yuv420p",
         "-video_track_timescale", str(_timescale(info.fps)),
-        "-movie_timescale", str(_timescale(info.fps)),
         str(out),
     ]
     return cmd
@@ -519,7 +518,6 @@ def _assemble_cmd(ffmpeg: str, listing: Path, src: Path, dst: Path, info,
         "-map", "0:v:0", "-map", "1:a:0?", "-map_metadata", "1",
         "-c", "copy",
         "-video_track_timescale", str(_timescale(info.fps)),
-        "-movie_timescale", str(_timescale(info.fps)),
     ]
     if encode.faststart:
         cmd += ["-movflags", "+faststart"]
@@ -700,20 +698,36 @@ class _PartSink:
             return
         proc, part, count = self._proc, self._part, self._count
         self._proc, self._part, self._count = None, -1, 0
+        path = self.parts_dir / PART_NAME.format(part)
         try:
             if proc.stdin and not proc.stdin.closed:
                 proc.stdin.close()
         except BrokenPipeError:
             pass
+        # Wait first, with a bound, then read stderr. An ffmpeg that will not exit is
+        # a real possibility here and it must not become a hang: this is a subprocess
+        # whose stdin has just been closed, so it has everything it is ever going to
+        # get. Reading stderr first would block on the same wait with no timeout at
+        # all. Safe in this order only because -v error keeps stderr far below the
+        # pipe buffer -- a chattier ffmpeg would deadlock on the buffer instead.
+        try:
+            proc.wait(timeout=STALL_LIMIT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise EncodeError(
+                f"the ffmpeg compositing {path.name} did not exit within "
+                f"{_hms(STALL_LIMIT)} of being given its last frame; killed it\n"
+                f"{drain(proc.stderr).strip()[:800]}")
         err = drain(proc.stderr)
-        proc.wait()
-        path = self.parts_dir / PART_NAME.format(part)
         if proc.returncode != 0:
+            path.unlink(missing_ok=True)
             raise EncodeError(f"compositing {path.name} failed (exit "
                               f"{proc.returncode}) after {count} frames:\n"
                               f"{err.strip()[:800]}")
         got = _part_length(path)
         if got != count:
+            path.unlink(missing_ok=True)
             raise EncodeError(f"{path.name} holds {got} frames but {count} were "
                               f"written into it; refusing to build a video out of "
                               f"parts that do not hold what they were given\n"
@@ -1390,7 +1404,21 @@ def run_propainter(
             # done and build a video with a gap in it. tests/test_resume.py pins this.
             crash = exc
         finally:
-            q_out.put(DONE)
+            # The sentinel must never be able to block. If the compositor has stopped
+            # draining -- its ffmpeg dead, or wedged -- a plain put() on a full queue
+            # waits forever and the whole run hangs silently, which is strictly worse
+            # than the failure that caused it: no message, no traceback, no clue. Give
+            # up on delivering it instead, and let the stall watch below say what is
+            # actually wrong. Frames left in the queue are not lost work -- their part
+            # is being abandoned either way.
+            sentinel = time.monotonic() + STALL_LIMIT
+            while True:
+                try:
+                    q_out.put(DONE, timeout=1.0)
+                    break
+                except queue.Full:
+                    if not t_encode.is_alive() or time.monotonic() > sentinel:
+                        break
             # Wait on *progress*, not on a fixed deadline. The last segment hands its
             # whole body over at once -- up to `segment` frames -- and the model is
             # idle from that moment on, so the flush is minutes of encoding with
