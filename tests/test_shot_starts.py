@@ -92,14 +92,16 @@ def main() -> int:
         fix = Path(td) / "scenes.mp4"
         build(ffmpeg, fix)
 
-        cpu = _shot_starts(ffmpeg, fix, 0.3, FPS, hwaccel=False)
+        # Scene cuts only here: black boundaries are the subject of
+        # tests/test_black_bounds.py, and this fixture has no black in it.
+        cpu, _ = _shot_starts(ffmpeg, fix, 0.3, FPS, hwaccel=False)
         check("cpu path finds every known cut", finds_all(cpu), f"{len(cpu)} cuts")
 
         # On a CUDA box this exercises NVDEC; without one it exercises the
         # fallback. Either way the requirement is the same: same cuts as the CPU
         # path, and if it fell back, it said so.
         logs: list[str] = []
-        hw = _shot_starts(ffmpeg, fix, 0.3, FPS, hwaccel=True, say=logs.append)
+        hw, _ = _shot_starts(ffmpeg, fix, 0.3, FPS, hwaccel=True, say=logs.append)
         fell_back = any("NVDEC" in m for m in logs)
         check("requesting NVDEC gives the same cuts", hw == cpu,
               f"{len(hw)} cuts, {'fell back' if fell_back else 'used the card'}")
@@ -108,7 +110,7 @@ def main() -> int:
               f"logged: {logs or 'nothing'}")
 
         check("threshold 0 skips the pass entirely",
-              _shot_starts(ffmpeg, fix, 0, FPS) == [])
+              _shot_starts(ffmpeg, fix, 0, FPS) == ([], []))
 
         try:
             _shot_starts(ffmpeg, Path(td) / "absent.mp4", 0.3, FPS)

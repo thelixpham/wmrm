@@ -104,6 +104,25 @@ MANIFEST_VERSION = 1
 STALL_POLL = 5.0
 STALL_LIMIT = 300.0
 
+# Black runs are the other half of "no segment spans a cut", and the half the scene
+# score cannot see. A fade through black is gradual by definition, so it never scores:
+# measured on a real intro (a black frame, a rating card, then a fade into the first
+# shot), `select='gt(scene,X)'` found nothing at all in the first 11.7s at any
+# threshold down to 0.1, while the picture went from pure black to full brightness at
+# frame 246. The black run and the shot after it therefore shared one segment, and the
+# model filled the hole on the black frames from the bright shot's reference frames:
+# a glowing smear over an otherwise black frame. It started at frame ~216, which is
+# ref_stride * ref_num / 2 = 40 frames ahead of the picture -- exactly the reach of
+# ProPainter's global references. blackdetect finds those boundaries for the price of
+# one more filter in a decode that was already happening.
+BLACK_PIX_TH = 0.10       # per-pixel luma, 0-1, below which a pixel counts as black
+BLACK_PIC_TH = 0.98       # fraction of the frame that has to be that dark
+
+# The dark-tile guard, which is the same defect caught one stage later and without
+# depending on any boundary being found. See _dark_guard.
+DARK_TILE_MAX = 24        # 99th-percentile luma around the hole, out of 255
+DARK_FILL_SLACK = 8       # how far above that a fill may sit before it is distrusted
+
 
 class ProPainterError(RuntimeError):
     pass
@@ -214,6 +233,11 @@ class ProPainterOpts:
     # the model alone. ProPainter needs frames to propagate from; a 4-frame segment
     # has none.
     min_shot: int = 16
+    # Also end a segment where the picture goes to black or comes back from it. This is
+    # not a second opinion on the scene score, it is the transition the scene score
+    # provably cannot see -- see BLACK_PIX_TH. It costs one extra filter in the scene
+    # scan, no extra decode. False falls back to scene cuts alone.
+    black_cuts: bool = True
     # Accepted and ignored, kept so existing command lines and presets do not break.
     #
     # It used to mean "this many segments in flight", which was worth having when each
@@ -573,7 +597,8 @@ def _fingerprint(src: Path, info, region, opts, encode, part_frames: int) -> dic
                   "neighbor_length": opts.neighbor_length,
                   "ref_stride": opts.ref_stride, "raft_iter": opts.raft_iter,
                   "mask_dilation": opts.mask_dilation, "fp16": bool(opts.fp16),
-                  "scene_threshold": opts.scene_threshold, "min_shot": opts.min_shot},
+                  "scene_threshold": opts.scene_threshold, "min_shot": opts.min_shot,
+                  "black_cuts": bool(opts.black_cuts)},
         "encode": {"crf": encode.crf, "preset": encode.x264_preset},
         "part_frames": part_frames,
     }
@@ -917,9 +942,56 @@ def _inpaint_or_split(worker, block: list, mask, say, depth: int = 0):
         return np.concatenate([first[:half], second[ctx:]])
 
 
+def _dark_guard(src_tile: np.ndarray, out_tile: np.ndarray, hole: np.ndarray,
+                ring: np.ndarray) -> np.ndarray | None:
+    """Refuse a fill that is brighter than the picture it sits in, where there is none.
+
+    ProPainter fills the hole from *other frames*, and in a black shot there are none
+    to fill from: the region is masked in every frame of it and nothing moves, so
+    flow-guided propagation contributes nothing and the entire fill is the
+    transformer's invention. An invention is not black. Against a black frame that is a
+    glowing smear exactly the size of the hole -- measured at 10/255 on a 1080p intro,
+    plainly visible at 4K -- and the same error over real footage is invisible, which is
+    why it only ever shows up in an intro.
+
+    Segmenting on black runs stops the worst of it by keeping bright reference frames
+    out of the segment, but it depends on a boundary being found. This does not: the
+    test is the one thing that is true whatever the model did, that a fill can be no
+    brighter than its surroundings. Where the tile around the hole holds no picture at
+    all, the hole gets the median of that surround instead of the invention -- black on
+    a black frame, and the watermark is just as gone.
+
+    Deliberately narrow. It fires only when there is provably nothing to inpaint from,
+    never to second-guess a fill that has real content around it, because the median of
+    a real surround would be a flat patch where the model had a picture.
+
+    Returns the corrected tile, or None to keep the model's answer.
+    """
+    around = src_tile[ring]
+    if around.size == 0:
+        return None
+    if float(np.percentile(around.max(axis=1), 99)) > DARK_TILE_MAX:
+        return None                       # there is a picture here; the model wins
+    fill = np.median(around, axis=0)
+    if int(out_tile[hole].max()) <= max(DARK_TILE_MAX, int(fill.max()) + DARK_FILL_SLACK):
+        return None                       # the fill already sits in the dark surround
+    fixed = out_tile.copy()
+    fixed[hole] = fill.astype(np.uint8)
+    return fixed
+
+
 def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float, *,
-                 hwaccel: bool = False, say=lambda m: None) -> list[int]:
-    """Frame indices where a new shot begins, via ffmpeg's scene score.
+                 black_min_frames: int = 0, hwaccel: bool = False,
+                 say=lambda m: None) -> tuple[list[int], list[int]]:
+    """Frame indices where a new shot begins: (scene cuts, black boundaries).
+
+    Two signals, one decode. The scene score finds hard cuts; `blackdetect` finds the
+    frame the picture goes black on and the frame it comes back on, which is the
+    transition the scene score cannot see at any threshold -- see BLACK_PIX_TH for the
+    measurement and for what it cost. Both filters publish to frame metadata, so the
+    second question is answered by one more filter in the graph rather than by a second
+    pass over the file. `blackdetect` goes first in the chain because it has to see
+    every frame and `select` drops most of them.
 
     One extra decode of the video, which is affordable here only because decoding is a
     small slice of this engine's cost: measured 7% against 77% for the model. It is not
@@ -939,14 +1011,25 @@ def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float, *,
     finds identical cuts but only pays when cores are the constraint, and they are not:
     it was 1.2x on a box whose serial pass already used 4.3 of 6 cores.
     """
-    if threshold <= 0:
-        return []
+    if threshold <= 0 and black_min_frames <= 0:
+        return [], []
+
+    chain: list[str] = []
+    if black_min_frames > 0:
+        # A black run shorter than `min_shot` would be merged away by _segment_plan, so
+        # asking for it would only produce boundaries nothing can use -- and in a night
+        # scene, thousands of them.
+        chain += [f"blackdetect=d={black_min_frames / max(fps, 1e-6):.4f}"
+                  f":pic_th={BLACK_PIC_TH}:pix_th={BLACK_PIX_TH}",
+                  "metadata=print:file=-"]
+    if threshold > 0:
+        chain += [f"select='gt(scene,{threshold})'", "metadata=print:file=-"]
+    vf = ",".join(chain)
 
     def attempt(extra: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
             [ffmpeg, "-v", "error", "-nostdin", *extra, "-i", str(src),
-             "-vf", f"select='gt(scene,{threshold})',metadata=print:file=-",
-             "-an", "-f", "null", "-"],
+             "-vf", vf, "-an", "-f", "null", "-"],
             capture_output=True, text=True)
 
     res = None
@@ -975,14 +1058,31 @@ def _shot_starts(ffmpeg: str, src: Path, threshold: float, fps: float, *,
             f"in the --pp-scene-threshold help first"
         )
 
-    out = set()
+    # `metadata=print` emits a `frame:.. pts_time:..` header and then one line per key,
+    # and only for frames that carry any -- so the header alone is not a cut. Reading
+    # the key rather than the header is also what keeps the two signals apart now that
+    # both are printing into the same pipe.
+    scene: set[int] = set()
+    black: set[int] = set()
+    at: int | None = None
     for line in (res.stdout + res.stderr).splitlines():
         if "pts_time:" in line:
             try:
-                out.add(int(round(float(line.split("pts_time:")[1].split()[0]) * fps)))
+                at = int(round(float(line.split("pts_time:")[1].split()[0]) * fps))
+            except (IndexError, ValueError):
+                at = None
+        elif "lavfi.scene_score" in line:
+            if at is not None:
+                scene.add(at)
+        elif "lavfi.black_start=" in line or "lavfi.black_end=" in line:
+            # The value is the boundary's own timestamp: `black_start` lands on the
+            # first black frame, `black_end` on the first frame that is not. Both are
+            # where a shot begins, which is what this returns.
+            try:
+                black.add(int(round(float(line.split("=", 1)[1]) * fps)))
             except (IndexError, ValueError):
                 continue
-    return sorted(out)
+    return sorted(scene), sorted(black)
 
 
 def _first_error(stderr: str) -> str:
@@ -1005,6 +1105,13 @@ def _segment_plan(shot_starts: list[int], total: int, segment: int,
 
     Context is clipped at the shot too, for the same reason: 20 frames of "context"
     from the previous scene is worse than none.
+
+    `shot_starts` carries black-run boundaries as well as scene cuts, and they are the
+    same thing to this function. They are not the same thing to the defect: a fade
+    through black scores below any useful threshold, so before those boundaries existed
+    the black intro shared a segment with the bright shot after it -- the worst possible
+    version of filling from the wrong scene, because black is the content least like
+    anything else. See BLACK_PIX_TH.
 
     Shots shorter than `min_shot` are merged forwards instead of being handed over
     alone, because below roughly a dozen frames the model has nothing to propagate
@@ -1109,22 +1216,32 @@ def run_propainter(
         # not changed since the last run answered it. The fingerprint covers the
         # source and the threshold, so a matching manifest means the same cuts.
         shot_starts = [int(c) for c in prior["cuts"]]
-        say(f"[pp] resume: reusing {len(shot_starts)} scene cut(s) from the manifest "
-            f"instead of decoding the source again to find them")
+        scene_cuts = black_cuts = None
+        say(f"[pp] resume: reusing {len(shot_starts)} shot boundary/ies from the "
+            f"manifest instead of decoding the source again to find them")
     else:
-        if opts.scene_threshold > 0:
-            say(f"[pp] scanning for scene cuts ({info.nframes or '?'} frames to "
-                f"decode, the one step here that is pure decode)"
+        looking = ([f"scene cuts (threshold {opts.scene_threshold})"]
+                   if opts.scene_threshold > 0 else [])
+        if opts.black_cuts:
+            looking.append("black runs")
+        if looking:
+            say(f"[pp] scanning for {' and '.join(looking)} ({info.nframes or '?'} "
+                f"frames to decode, the one step here that is pure decode)"
                 + (" -- via NVDEC" if use_nvdec else " -- on the CPU"))
-        shot_starts = _shot_starts(ffmpeg, src, opts.scene_threshold, float(info.fps),
-                                   hwaccel=use_nvdec, say=say)
+        scene_cuts, black_cuts = _shot_starts(
+            ffmpeg, src, opts.scene_threshold, float(info.fps),
+            black_min_frames=opts.min_shot if opts.black_cuts else 0,
+            hwaccel=use_nvdec, say=say)
+        shot_starts = sorted(set(scene_cuts) | set(black_cuts))
     _plan_est_total = info.nframes or (1 << 30)
     plan = _segment_plan(shot_starts, _plan_est_total, opts.segment, opts.overlap,
                          opts.min_shot)
     t_cuts = time.monotonic() - t0
-    if opts.scene_threshold > 0:
-        say(f"[pp] scene detection: {len(shot_starts)} cut(s) found in {_hms(t_cuts)} "
-            f"(threshold {opts.scene_threshold})")
+    if (scene_cuts is not None and black_cuts is not None
+            and (opts.scene_threshold > 0 or opts.black_cuts)):
+        say(f"[pp] shot detection: {len(scene_cuts)} scene cut(s) + "
+            f"{len(black_cuts)} black boundary/ies -> {len(shot_starts)} boundary/ies "
+            f"in {_hms(t_cuts)}")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     n_total = info.nframes or 0
@@ -1235,10 +1352,33 @@ def run_propainter(
                 except queue.Full:
                     continue
 
+        def emit_body(out, block: list[np.ndarray], n_left: int, n_body: int) -> None:
+            """Emit this segment's body, in order, past the dark-tile guard.
+
+            Frame j is produced by exactly one segment, so ordering here is positional
+            and not a race. On a resumed run the head of this segment is already in a
+            finished part; it was recomputed to make the rest of the segment
+            reproducible, and it is dropped here rather than written twice.
+            """
+            nonlocal emitted, guarded
+            for i in range(n_left, n_left + n_body):
+                if pos + (i - n_left) < resume_from:
+                    continue
+                tile_out = out[i]
+                fixed = _dark_guard(block[i], tile_out, hole_px, ring_px)
+                if fixed is not None:
+                    tile_out = fixed
+                    guarded += 1
+                emit(np.ascontiguousarray(tile_out))
+                emitted += 1
+
         n = 0                  # frames read by this run
         emitted = 0            # frames handed to the compositor by this run
         pos = pos0             # absolute index of buf[0] -- not `emitted`, which on a
                                # resumed run starts counting again from zero
+        hole_px = region.inpaint_mask > 0     # what the model replaced
+        ring_px = ~hole_px                    # the picture it had to match
+        guarded = 0            # frames the dark-tile guard corrected
         nonfinite_total = 0
         nonfinite_at: set[int] = set()
         model_frames = 0       # frames the model actually ran on, context included
@@ -1264,10 +1404,11 @@ def run_propainter(
 
         if shot_starts:
             lens = [e - s for s, e, _, _ in plan]
-            say(f"[pp] {len(shot_starts)} scene cut(s) -> {len(plan)} segment(s), "
-                f"{min(lens)}-{max(lens)} frames each; no segment spans a cut")
+            say(f"[pp] {len(shot_starts)} shot boundary/ies -> {len(plan)} segment(s), "
+                f"{min(lens)}-{max(lens)} frames each; no segment spans a cut or a "
+                f"black run")
         else:
-            say(f"[pp] no scene cuts found -> {len(plan)} fixed segment(s) of "
+            say(f"[pp] no shot boundaries found -> {len(plan)} fixed segment(s) of "
                 f"{opts.segment}")
 
         try:
@@ -1331,16 +1472,7 @@ def run_propainter(
                         f"repaired tile is {out.shape[2]}x{out.shape[1]}, expected "
                         f"{tile.w}x{tile.h}")
 
-                # Emit only the body, in order. Frame j is produced by exactly one
-                # segment, so ordering here is positional and not a race. On a resumed
-                # run the head of this segment is already in a finished part; it was
-                # recomputed to make the rest of the segment reproducible, and it is
-                # dropped here rather than written twice.
-                for i in range(len(left), len(left) + len(body)):
-                    if pos + (i - len(left)) < resume_from:
-                        continue
-                    emit(np.ascontiguousarray(out[i]))
-                    emitted += 1
+                emit_body(out, block, len(left), len(body))
                 pos += body_len
 
                 el = time.monotonic() - t_start
@@ -1381,15 +1513,11 @@ def run_propainter(
                     f"{body_len} frames -- the source reported {est_total} frames but "
                     f"has more, so these are cut on size, not on shots")
                 ts = time.monotonic()
-                out = _inpaint_or_split(worker, left + body + ahead,
-                                        region.inpaint_mask, say)
+                block = left + body + ahead
+                out = _inpaint_or_split(worker, block, region.inpaint_mask, say)
                 t_model += time.monotonic() - ts
-                model_frames += len(left) + body_len + ahead_len
-                for i in range(len(left), len(left) + body_len):
-                    if pos + (i - len(left)) < resume_from:
-                        continue
-                    emit(np.ascontiguousarray(out[i]))
-                    emitted += 1
+                model_frames += len(block)
+                emit_body(out, block, len(left), body_len)
                 pos += body_len
                 if opts.overlap:
                     hist = (hist + body)[-opts.overlap:]
@@ -1503,6 +1631,14 @@ def run_propainter(
         shutil.rmtree(parts_dir, ignore_errors=True)
 
     total = time.monotonic() - t_start
+    if guarded:
+        # Said out loud rather than counted silently: a handful of frames is the intro
+        # doing what intros do, and a number anywhere near the frame count means the
+        # footage itself is dark and the fill is being replaced by a flat patch all
+        # the way through -- which is a reason to look at the output, not to trust it.
+        say(f"[pp] the dark-tile guard replaced the model's fill on {guarded} frame(s) "
+            f"whose surroundings held no picture ({100.0 * guarded / max(n, 1):.1f}% "
+            f"of this run) -- see _dark_guard")
     if nonfinite_total:
         say(f"[pp] WARNING {nonfinite_total} non-finite model output value(s) across "
             f"{len(nonfinite_at)} frame(s): {sorted(nonfinite_at)[:12]}"

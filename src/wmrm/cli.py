@@ -206,6 +206,7 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
                                 fp16=not args.no_fp16,
                                 scene_threshold=args.pp_scene_threshold,
                                 min_shot=args.pp_min_shot,
+                                black_cuts=args.pp_black_cuts,
                                 workers=args.pp_workers),
         )
     if args.quality == "fast":
@@ -768,7 +769,21 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                         "different scene: measured, a 30-frame shot inside a 440-frame "
                         "segment had the watermark region filled with the wrong "
                         "scene's content for its whole duration. 0 disables detection "
-                        "and cuts every --pp-segment frames regardless of content")
+                        "and cuts every --pp-segment frames regardless of content. "
+                        "Note what it cannot do: a fade through black is gradual and "
+                        "never scores at any threshold, which is what --pp-black-cuts "
+                        "is for")
+    p.add_argument("--pp-no-black-cuts", action="store_false", dest="pp_black_cuts",
+                   help="do not end a segment where the picture goes to or comes back "
+                        "from black. On by default, and it is not a second opinion on "
+                        "the scene score: a fade through black scored below 0.1 on a "
+                        "real intro while the picture went from black to full "
+                        "brightness, so the black run shared a segment with the shot "
+                        "after it and the model filled the watermark hole on the black "
+                        "frames from the bright shot -- a glowing smear over an "
+                        "otherwise black frame, 40 frames wide, which is exactly the "
+                        "reach of its global references. Costs one filter in the scene "
+                        "scan, no extra decode")
     p.add_argument("--pp-min-shot", type=int, default=16,
                    help="shots shorter than this are merged with the previous one "
                         "(default 16). Below roughly a dozen frames the model has "

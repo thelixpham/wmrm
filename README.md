@@ -231,6 +231,52 @@ If they sit next to each other — a studio logo beside a rating mark is the nor
 case — use one box covering both. Marks far apart are not supported in a single
 pass; run the tool twice, feeding the second run the first run's output.
 
+**Nothing in the normal flow tells you a second mark exists.** `wmrm detect`
+searches one corner by design, and `wmrm coverage` only inspects a ring around the
+box you gave it — "covered" means *nothing survives just outside this box*, never
+*the frame is clean*. A studio logo in one corner and a caption in the other will
+pass every check a run makes and still be in the output. Measured on a real file:
+detection found the rating badge, coverage said covered, verify passed, and two
+other marks were untouched.
+
+So look at the whole frame first:
+
+```bash
+python scripts/scan-fixed-edges.py VIDEO.mp4
+```
+
+It averages the *signed* gradient over 60 frames spread across the clip. Moving
+content points different ways from frame to frame and cancels; anything pinned to
+the same pixels survives. Two PNGs land next to the video — the raw energy map, and
+the same in red over a real frame. Every fixed overlay in the video is legible in
+them, including semi-transparent ones that a variance test would miss entirely.
+It reports no boxes on purpose: see the script's docstring for the five rounds of
+threshold tuning that produced nothing trustworthy, and read the coordinates off
+the picture instead.
+
+**Detect can be made to pick up a second mark in the same corner.** It rejects
+anything not present in ≥90% of sampled frames, which is what stops it boxing
+subtitles — but a studio logo that is not on for the whole film looks identical to
+that rule. Lower it a notch at a time and check each result:
+
+```bash
+wmrm run VIDEO.mp4 --persistence 0.5 --preview-only    # look, decide, no processing
+wmrm run VIDEO.mp4 --persistence 0.5                   # detect and process, one command
+```
+
+Every detect knob — `--corner`, `--samples`, `--roi-frac`, `--grad-threshold`,
+`--persistence`, `--max-area` — works on `run` and `batch`, not just on `detect`,
+because they are the commands that use the box. Tuning detection does not cost you a
+separate `detect` invocation and a preset file to pass back in. `run` writes the box
+it settled on to `<input>-preset.json` either way, so once a source is dialled in you
+can stop detecting and pass that instead.
+
+Components that survive are unioned into one box automatically, so a second mark
+that clears the threshold joins the first one on its own. Verify each step: a lower
+threshold also lets *static scenery* qualify as a pixel-locked edge — a fixed camera
+on a plain surface is exactly the case that inflates the box — and a box that has
+crept into the background costs GPU time for nothing.
+
 ---
 
 ## Install
@@ -604,6 +650,93 @@ indistinguishable from a clean scan that found nothing: the run would report "no
 scene cuts found", plan fixed segments, and silently lose the protection this
 pass exists to provide.
 
+#### The scene score cannot see a fade through black — the same pass now looks for one
+
+The transition that matters most to this model is the one its cut detection is blind
+to. A fade is gradual by definition, so it never scores. Measured on a real intro — a
+black frame, a rating card, then a fade into the first shot:
+
+| | found |
+| --- | --- |
+| `select='gt(scene,0.3)'` over the first 20 s | cuts at 11.78 s and 15.65 s, **nothing at the fade** |
+| same at threshold 0.1 | the same two cuts |
+| what the picture actually did | pure black through frame 243, full brightness by frame 246 |
+
+So the black run and the bright shot after it were planned as **one segment**, which is
+exactly the case segmenting on cuts exists to prevent. The watermark region is masked in
+every frame of a black run and nothing moves in it, so flow-guided propagation has
+nothing to propagate: the whole fill becomes the transformer's invention, conditioned on
+that segment's reference frames, which were the bright ones. The output was a glowing
+smear the size of the hole over an otherwise black frame. It began at frame ~216 —
+`ref_stride * ref_num / 2` = **40 frames** ahead of the picture, i.e. precisely the reach
+of ProPainter's global references, which is what identified the mechanism. Measured at
+10/255 on a 1080p output, where nobody noticed it, and plainly visible at 4K.
+
+`blackdetect` answers what the scene score cannot, for one more filter in a pass that
+was already decoding every frame — no second decode. Its boundaries (the first black
+frame, and the first frame that is not) join the scene cuts, so a black run becomes its
+own segment and bright frames can never be its references. Black runs shorter than
+`--pp-min-shot` are not asked for: `_segment_plan` would merge them away, and in a night
+scene there would be thousands. `--pp-no-black-cuts` opts out.
+
+**A second, independent guard, because the first one depends on a boundary being
+found.** `_dark_guard` checks the one thing that is true whatever the model did: a fill
+can be no brighter than the picture it sits in. Where the tile *around* the hole holds no
+picture at all — 99th-percentile luma ≤ 24/255 — the hole gets the median of that
+surround instead of the invention, which is black on a black frame and removes the
+watermark just the same. It is deliberately narrow: with real content around the hole,
+or a dark shot that still holds something bright, the model wins, because a median over a
+real surround would be a flat patch where there was a picture. The count of corrected
+frames is reported at the end of the run, so footage dark enough for this to fire all the
+way through is visible as such instead of silently flattened.
+
+### A killed run resumes — `--resume` is the default
+
+A feature-length 4K file is 4–9 hours of model time. It used to be all-or-nothing:
+the output was one temp file, and any failure deleted it. Measured twice on the same
+job, at the very last segment, after nine hours each time.
+
+The video is now composited in **parts** of `--pp-part` frames (default 3600, two
+minutes at 30fps), written to `<output>.parts/` beside the output and joined by
+stream copy at the end. A part whose frame count checks out is finished for good, so
+a crash costs at most one part — everything else is on disk and gets reused.
+
+```bash
+wmrm run big.mp4 --preset box.json     # dies at hour 8
+wmrm run big.mp4 --preset box.json     # carries on from the last finished part
+```
+
+The same command, twice. **`--resume` is on by default**, and the asymmetry is
+deliberate: off by default, forgetting the flag silently deletes hours of finished
+work before you can read the message; on by default, the worst case is reusing work
+it should not have — and that cannot happen, because the manifest fingerprints the
+source and every setting that decides a pixel. Change the box, the segment size, the
+crf, or the input, and it starts over on its own and says which setting changed.
+`--no-resume` forces that.
+
+Two details that make resumption exact rather than approximate:
+
+- The model **restarts at the beginning of the segment** the crash landed in, not at
+  the next frame. A segment's output depends on the whole block it was handed, so
+  restarting mid-segment would give those frames different context and different
+  pixels. `tests/test_resume.py` pins the result byte-identical to an uninterrupted
+  run — that is the property, not "looks about right".
+- Scene cuts and the auto-chosen segment size are read back from the manifest, so a
+  resume neither re-decodes the whole source to find the same cuts nor asks
+  `auto_segment` again — free VRAM at startup is not a property of the video, and
+  half a film made with different settings from the other half is not acceptable.
+
+Watch progress at any time. The parts are ordinary mp4 files:
+
+```bash
+ls -1 <output>.parts/part-*.mp4 | wc -l     # how many are done
+ffplay <output>.parts/part-000042.mp4       # what the result looks like
+```
+
+Budget disk for **twice the output size**: the join needs the parts and the finished
+file to exist at the same moment. The parts directory is deleted only after the
+joined file has been verified and moved into place.
+
 ### Which `--quality`, and how long it takes
 
 Measured on CPU (6 cores). The 1080p column is a real clip with a 284x62 mark:
@@ -634,8 +767,23 @@ cuts its runtime roughly N-fold; read the caveat below first.
 `--corner tr|tl|br|bl` (default `tr`), `--samples 40`, `--roi-frac 0.30`,
 `--grad-threshold 10`, `--persistence 0.90`, `--max-area 10`.
 
+All of them are accepted by `run` and `batch` too, which detect on their own when
+given neither `--box` nor `--preset`. There is no detect-then-run pipeline to
+assemble: `wmrm run VIDEO.mp4 [detect knobs]` is that pipeline, and it writes the
+box it used to `<input>-preset.json` on the way through.
+
 Defaults are fine for a corner badge. Lower `--grad-threshold` for a fainter
-watermark.
+watermark, and `--persistence` for a mark that is not on screen the whole film —
+see [More than one watermark?](#more-than-one-watermark) for why that one rejects a
+real logo and how to check the box it gives you instead.
+
+`wmrm run` with neither `--box` nor `--preset` detects and processes in one command,
+and writes the box it used to `<input>-preset.json`. That file is a record, not an
+input: nothing picks it up on its own, because a preset that merely happens to exist
+quietly overriding what the command asked for is a failure this project has already
+had once. Pass it with `--preset` to reuse it — which is the right move for a batch
+from one source, since the coordinates are normalized and a box measured on a 4K file
+applies unchanged to the 1080p cut of the same layout.
 
 ---
 
