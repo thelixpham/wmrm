@@ -942,7 +942,7 @@ would rather not serve them at all.
 | `GET /jobs/{id}` | state, phase, progress, outcome, the run's report |
 | `GET /jobs` | every job this pod knows about. Used to reconcile against whoever dispatched them |
 | `POST /jobs/{id}/cancel` | 202, idempotent |
-| `GET /jobs/{id}/log?tail=N` | the last N lines of stderr. For a human — nothing in the protocol parses it |
+| `GET /jobs/{id}/log?tail=N` | the last N lines, when per-job files are on (see below). For a human — nothing in the protocol parses it |
 | `DELETE /jobs/{id}` | remove a finished job's state and work directory |
 
 A submission, with the three shapes an input can take:
@@ -975,6 +975,49 @@ are sent as positives and inverted on the way through: `"fp16": false` becomes
 `coverageGate` defaults to **`strict`** here, unlike the CLI. An unattended run is exactly
 the case that must not ship a maybe: a box the coverage check calls too small fails the
 job, and one it cannot judge sends the job for review rather than guessing.
+
+### Watching a run
+
+Everything a run prints goes to **the server's own output**, one line at a time, tagged
+with the last six characters of the job id:
+
+```
+[job job_01J...] accepted: engine=video input=r2 (no box -- the pod will detect one)
+[r2] uploads/3d80.../4K_MOGI-130.mp4 -> /workspace/wmrm-work/abc123/job_01J.../4K_MOGI-130.mp4
+[r2] 37.3 MiB in 1 chunks of 64.0 MiB, 8 workers
+[job job_01J...] source ready: 4K_MOGI-130.mp4 -> 4K_MOGI-130-clean.mp4, publishing to output/job_01J.../...
+[T0V1] [cfg] engine   : propainter (flow propagation across frames)  (--quality video)
+[T0V1] [pp] EXTRAPOLATED  1 hour of this footage -> ~1h23m
+[T0V1] => all checks passed
+[job job_01J...] wmrm run exited 0 after 181s
+[job job_01J...] succeeded (outcome=ok) -> output/job_01J.../4K_MOGI-130-clean.mp4
+```
+
+The `[r2]` lines happen in the server process, so they appear directly. The `[T0V1]` lines
+are the run's own output, read a line at a time from its pipe by a dedicated thread —
+which is the part that matters, because a pipe nobody drains fills up and blocks the child.
+Memory is one line regardless of how long the run is.
+
+So keep the server's output somewhere if you want it after a restart. One file for the pod
+beats one per job:
+
+```bash
+wmrm serve 2>&1 | tee -a /workspace/wmrm-serve.log
+```
+
+| | default | |
+| --- | --- | --- |
+| `WMRM_ECHO_RUN` | on | the echo above. `0` silences it |
+| `WMRM_RUN_LOG` | **off** | a `run.log` per job in its work directory. `1` turns it on, and is what `GET /jobs/{id}/log` reads |
+
+Per-job files are off because logs get read by going into the pod, where the server's
+output is already in front of you — a second copy is two places to look and one of them
+nobody opens.
+
+**On a short clip the run looks idle, and it is not.** Progress is counted from finished
+parts in `<output>.parts/`, and `ppPart` defaults to 3600 frames — so a one-minute clip is
+a single part and there is nothing to count. It only becomes informative on long footage:
+two hours at 30 fps is about 60 parts.
 
 ### What the pod tells you
 

@@ -235,9 +235,7 @@ class JobRunner:
             hb = asyncio.create_task(self._heartbeat(spec, rec, dst, notifier))
             started = time.time()
             code = await self._spawn(spec, rec, src, dst, report_path, log_path)
-            _say(spec.jobId,
-                 f"wmrm run exited {code} after {time.time() - started:.0f}s "
-                 f"-- full output in {log_path}")
+            _say(spec.jobId, f"wmrm run exited {code} after {time.time() - started:.0f}s")
 
             report = self._read_report(report_path)
             outcome = self._decide_outcome(rec, report, code)
@@ -431,22 +429,73 @@ class JobRunner:
         env = dict(os.environ)
         env.setdefault("PYTHONUNBUFFERED", "1")
 
-        # stderr goes to a file, not a pipe. A nine-hour run produces far more log than
-        # is sensible to hold in memory, and nothing here reads it programmatically.
-        with open(log_path, "ab") as log:
-            log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                      f"{' '.join(argv)}\n".encode())
-            log.flush()
-            proc = subprocess.Popen(
-                argv, stdout=log, stderr=log, env=env,
-                cwd=str(dst.parent),
-                start_new_session=True,      # its own process group: see module docstring
-            )
+        # The run's output goes to a file **and** to this server's log, one line at a time.
+        #
+        # It used to go only to the file, on the reasoning that a nine-hour run produces far
+        # more log than is sensible to hold in memory. The first half of that is right; the
+        # conclusion was not. Nothing has to be *held* to be shown -- a line is read,
+        # written, echoed and dropped, so the memory cost is one line no matter how long the
+        # run is. What the file-only version actually bought was a console that went silent
+        # for hours, where a working job and a wedged one look identical.
+        #
+        # **The per-job file is off by default**, and the console echo is on.
+        #
+        # It was the other way round, and the argument for the file was `GET /jobs/{id}/log`
+        # -- reading a job's log without a shell on the pod. That argument does not survive
+        # how this is actually operated: logs get read by going into the pod, where the
+        # server's own output is right there, so a second copy per job was two places to
+        # look and one of them nobody opens.
+        #
+        # What is genuinely lost is durability across a restart, and the answer to that is
+        # one log for the pod rather than one per job:
+        #
+        #     wmrm serve 2>&1 | tee -a /workspace/wmrm-serve.log
+        #
+        # WMRM_RUN_LOG=1 brings the per-job files back; WMRM_ECHO_RUN=0 silences the console.
+        #
+        # The pipe is read by a dedicated thread. That matters: a pipe nobody drains fills
+        # up and blocks the child, which is the failure the file-only version was avoiding.
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+            cwd=str(dst.parent),
+            start_new_session=True,          # its own process group: see module docstring
+        )
         self._procs[spec.jobId] = proc
         rec.set(pid=proc.pid)
 
-        # Reaped off the event loop so a running job never blocks the API.
-        return await asyncio.to_thread(proc.wait)
+        def flag(name: str, default: str) -> bool:
+            return os.environ.get(name, default).lower() not in ("0", "off", "false", "no")
+
+        echo = flag("WMRM_ECHO_RUN", "1")     # on: the console is where logs get read
+        to_file = flag("WMRM_RUN_LOG", "0")   # off: a second copy nobody opens
+        # Short tag rather than the whole job id: with more than one job at a time the
+        # console interleaves, and 40 characters of prefix on every line is its own problem.
+        tag = f"[{spec.jobId[-6:]}] "
+
+        def pump() -> int:
+            # nullcontext rather than a branch around the loop, so the reading half exists
+            # in exactly one place -- draining the pipe is the part that must not be
+            # accidentally skipped, since a full pipe blocks the child.
+            from contextlib import nullcontext
+
+            opened = open(log_path, "ab") if to_file else nullcontext(None)
+            with opened as log:
+                if log is not None:
+                    log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                              f"{' '.join(argv)}\n".encode())
+                    log.flush()
+                assert proc.stdout is not None
+                for raw in proc.stdout:
+                    if log is not None:
+                        log.write(raw)
+                        log.flush()         # so `tail -f` keeps up with a long run
+                    if echo:
+                        sys.stderr.write(tag + raw.decode("utf-8", "replace"))
+                        sys.stderr.flush()
+            return proc.wait()
+
+        # Off the event loop, so a running job never blocks the API.
+        return await asyncio.to_thread(pump)
 
     def _read_report(self, path: Path) -> dict[str, Any] | None:
         try:

@@ -286,6 +286,16 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="no such job on this pod")
         path = Path(rec.data.get("workDir") or "") / "run.log"
         if not path.is_file():
+            # Says which of the two it is, because they lead somewhere different: a job that
+            # has not written anything yet, or a pod that keeps no per-job file at all.
+            # Returning "" for both sends whoever is debugging to look for a file that was
+            # never going to exist.
+            if os.environ.get("WMRM_RUN_LOG", "0").lower() in ("0", "off", "false", "no"):
+                return ("No per-job log file on this pod: WMRM_RUN_LOG is off, which is the "
+                        "default. The run's output goes to the server's own output instead, "
+                        "so read it there -- or start the server with "
+                        "`wmrm serve 2>&1 | tee -a /workspace/wmrm-serve.log` to keep it. "
+                        "WMRM_RUN_LOG=1 restores a run.log per job.")
             return ""
         with open(path, "rb") as fh:
             # Read from the end: these files reach hundreds of megabytes on a long run.
