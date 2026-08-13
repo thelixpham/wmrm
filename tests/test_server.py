@@ -325,6 +325,69 @@ def test_capacity_and_idempotency(tmp: Path) -> None:
           dec.stdout.decode()[:60])
 
 
+def test_output_omitted(tmp: Path) -> None:
+    """An absent `output` must be accepted, and must not be read as a demand for R2.
+
+    This is the shape the queue actually sends: the pod derives
+    `output/<jobId>/<stem>-clean<ext>` because it already knows both halves. An earlier
+    version required the field, and when it was made optional the credential check still
+    read `spec.output.kind` -- so a payload without it crashed with AttributeError instead
+    of being accepted. Hence a test for the omission specifically.
+    """
+    print("\n[output omitted]")
+    root = FIXTURE.parent
+    auth = {"authorization": "Bearer dev-token"}
+
+    saved = {k: os.environ.pop(k, None) for k in
+             ("R2_ACCOUNT_ID", "R2_ENDPOINT", "R2_ACCESS_KEY_ID",
+              "R2_SECRET_ACCESS_KEY", "R2_BUCKET", "AWS_ACCESS_KEY_ID",
+              "AWS_SECRET_ACCESS_KEY", "S3_BUCKET", "CLOUDFLARE_ACCOUNT_ID")}
+    try:
+        client, cfg = make_client(tmp / "no-output", input_root=root)
+        check("this pod has no R2, so a derived output stays local",
+              cfg.r2_configured is False)
+        with client as c:
+            r = c.post("/jobs", headers=auth, json={
+                "jobId": "no_output",
+                "dispatchToken": "dt",
+                "input": {"kind": "local", "path": str(FIXTURE)},
+                "engine": "unblend",
+                "options": {"device": "cpu", "coverageGate": "off"},
+            })
+            check("a job without output is accepted", r.status_code == 202,
+                  f"{r.status_code} {str(r.json())[:120]}")
+
+            # The derived plan is recorded before the run finishes, so the caller can see
+            # where the result is going rather than waiting to find out.
+            for _ in range(40):
+                body = c.get("/jobs/no_output", headers=auth).json()
+                if body.get("state") in ("running", "succeeded", "failed"):
+                    break
+                time.sleep(0.5)
+            check("the pod planned an output path itself",
+                  bool(body.get("state")), str(body.get("state")))
+            c.post("/jobs/no_output/cancel", headers=auth, json={})
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    # Minimal payload: four fields and nothing else.
+    from wmrm.server.models import JobSpec
+
+    spec = JobSpec.model_validate({
+        "jobId": "minimal",
+        "dispatchToken": "dt",
+        "input": {"kind": "r2", "key": "uploads/a/b.mp4"},
+        "engine": "video",
+    })
+    check("four fields validate", spec.jobId == "minimal")
+    check("output defaults to None", spec.output is None)
+    check("box defaults to None", spec.box is None)
+    check("schema defaults to 1", spec.schema_ == 1)
+    check("heartbeat defaults to 30", spec.heartbeatEverySeconds == 30)
+
+
 def test_r2_kinds(tmp: Path) -> None:
     """A pod without credentials must refuse `kind: "r2"` at submit time.
 
@@ -483,6 +546,7 @@ def main() -> int:
         test_auth(tmp)
         test_health_shape(tmp)
         test_validation(tmp)
+        test_output_omitted(tmp)
         test_r2_kinds(tmp)
         test_orphan_adoption(tmp)
         test_capacity_and_idempotency(tmp)

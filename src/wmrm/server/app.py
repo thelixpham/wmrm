@@ -211,8 +211,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         # Refused here rather than discovered by the job. A pod without credentials
         # cannot fetch a key or publish a result, and finding that out after the job is
         # accepted turns a clear 400 into a mysterious failure on someone else's machine.
-        if (spec.input.kind == "r2" or spec.output.kind == "r2") \
-                and not cfg.r2_configured:
+        #
+        # An absent `output` is not a request for R2: the pod derives one, and falls back to
+        # leaving the file in the work directory when there are no credentials. Only an
+        # explicit `kind: "r2"` is a demand.
+        wants_r2 = spec.input.kind == "r2" or (
+            spec.output is not None and spec.output.kind == "r2"
+        )
+        if wants_r2 and not cfg.r2_configured:
             raise HTTPException(
                 status_code=400,
                 detail=f"this pod has no R2 credentials, so it cannot use "

@@ -106,8 +106,18 @@ class JobRunner:
             return None
         root = self.cfg.local_input_root
         if root is None:
+            # Says what to do, because this is exactly the moment someone needs it -- and
+            # the first suggestion is the one that is almost always right, since a pod with
+            # R2 credentials has no reason to read from its own disk.
             raise ValueError(
-                "input.kind='local' but WMRM_LOCAL_INPUT_ROOT is not set on this pod")
+                "input.kind='local' needs WMRM_LOCAL_INPUT_ROOT set on this pod, and it "
+                "is not. Either use input.kind='r2' with the object key "
+                + ("(this pod has R2 credentials, so that is the normal path), "
+                   if self.cfg.r2_configured
+                   else "(needs R2_* on this pod), ")
+                + "or restart with WMRM_LOCAL_INPUT_ROOT=/workspace/wmrm to allow local "
+                "files from there. The root exists so a path cannot escape it: without "
+                "one, anyone holding the pod token could read any file the pod can.")
         candidate = Path(spec.input.path or "").expanduser()
         try:
             resolved = candidate.resolve(strict=True)
