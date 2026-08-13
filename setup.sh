@@ -142,13 +142,72 @@ fi
 
 torch_index="https://download.pytorch.org/whl/$cuda"
 have_torch="$("$PY" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
-want_gpu=$([[ "$cuda" == cpu ]] && echo 0 || echo 1)
-have_gpu=$("$PY" -c 'import torch; print(1 if torch.version.cuda else 0)' 2>/dev/null || echo 0)
+# The local version tag ("2.6.0+cu124" -> "cu124") is the only thing that says which index
+# a wheel actually came from. Whether `torch.version.cuda` is non-empty is a different
+# question, and asking that one instead was the hole here: a cu130 build on a 12.4 driver
+# has a CUDA version, passes that check, reports "already installed", and then cannot see
+# the card -- so re-running the script could never repair it. A plain PyPI wheel carries no
+# tag at all, which compares unequal to every $cuda, on purpose.
+have_tag="${have_torch#*+}"
+[[ "$have_tag" == "$have_torch" ]] && have_tag=""
 
-if [[ -n "$have_torch" && "$want_gpu" == "$have_gpu" ]]; then
+if [[ -n "$have_torch" && "$have_tag" == "$cuda" ]]; then
   ok "already installed: $have_torch"
 else
-  [[ -n "$have_torch" ]] && warn "replacing $have_torch: it is the wrong build for this machine"
+  # Ask the index which versions it really has, for this interpreter and this machine, and
+  # pin to the newest of them. Unpinned, the index is only a *preference*:
+  # `unsafe-best-match` below is required (see the cudnn note) and it makes uv take the
+  # highest version across every index, so a bare `torch` resolves to whatever PyPI ships
+  # today -- which is how this venv first ended up with 2.13.0+cu130 on a 550 driver, with
+  # every line above still reporting cu124. Discovered rather than hardcoded because the
+  # ceiling moves: cu124 stops at torch 2.6.0, cu128 reaches 2.11.0, and a table written
+  # today is wrong by the next release.
+  py_tag="$("$PY" -c 'import sys; print("cp%d%d" % sys.version_info[:2])')"
+  arch="$(uname -m)"
+  # Both platform tags have to match: torch <= 2.6 is `linux_x86_64`, 2.7+ is
+  # `manylinux_2_28_x86_64`. Matching only the old one makes the newer indexes read as
+  # empty, which looks identical to "index unreachable".
+  # The trailing `|| true` is load-bearing under `set -o pipefail`: an unreachable index
+  # (curl) or simply no matching wheel (grep) makes the pipeline non-zero, and a failing
+  # command substitution in an assignment is exactly what `set -e` exits on. Without it the
+  # "could not read the listing" fallback below is unreachable -- the script dies instead.
+  newest_on_index() {
+    curl -fsSL --max-time 30 "$torch_index/$1/" 2>/dev/null \
+      | grep -oE "$1-[0-9]+\.[0-9]+\.[0-9]+%2B$cuda-$py_tag-$py_tag-(many)?linux[a-z0-9_.]*_$arch\.whl" \
+      | sed -E "s/^$1-([0-9.]+)%2B.*/\1/" | sort -uV | tail -1 || true
+  }
+  t_ver="$(newest_on_index torch)"
+  v_ver="$(newest_on_index torchvision)"
+  if [[ -n "$t_ver" && -n "$v_ver" ]]; then
+    # The `+$cuda` tag is part of the pin deliberately: PEP 440 sorts `2.6.0+cu124` above a
+    # plain `2.6.0`, so even an identically-versioned PyPI wheel cannot win the tie.
+    pins=("torch==$t_ver+$cuda" "torchvision==$v_ver+$cuda")
+    ok "$cuda serves torch $t_ver / torchvision $v_ver for $py_tag/$arch -- pinning both"
+  else
+    pins=(torch torchvision)
+    warn "could not read the $cuda listing -- falling back to unpinned. If verify below"
+    warn "says the CUDA build cannot see the device, the resolver preferred a newer build"
+    warn "from PyPI; re-run once the index is reachable."
+  fi
+
+  if [[ -n "$have_torch" ]]; then
+    warn "replacing $have_torch: built for ${have_tag:-no index tag}, this machine needs $cuda"
+    # uv will not remove the old runtime on its own: cu13 ships as `nvidia-*-cu13` plus
+    # `cuda-*`, cu12 ships as `nvidia-*-cu12`, and those are different package names. A
+    # plain reinstall therefore leaves both generations installed and sharing the `nvidia/`
+    # namespace packages. Clearing them is the other half of making a re-run sufficient;
+    # before, recovering took deleting the venv by hand.
+    # `|| true` for the same pipefail reason as above: grep finding nothing is a normal
+    # outcome here, not a failure.
+    stale="$(uv pip freeze 2>/dev/null \
+      | grep -E '^(torch|torchvision|triton|pytorch-triton|nvidia-|cuda-)' \
+      | cut -d= -f1 | tr '\n' ' ' || true)"
+    if [[ -n "${stale// /}" ]]; then
+      uv pip uninstall $stale >/dev/null 2>&1 || true
+      ok "removed the previous torch stack ($(wc -w <<<"$stale") packages)"
+    fi
+  fi
+
   # torch and torchvision in one command, from one index. Installed separately or from
   # different indexes they resolve to a mismatched pair, and the symptom is
   # `operator torchvision::nms does not exist`, which mentions neither of them.
@@ -165,15 +224,15 @@ else
   # at the first index that has the package NAME, and cu124 does have nvidia-cudnn-cu12 --
   # just not the pinned version. So it would keep failing with PyPI merely listed.
   #
-  # The cost of best-match is that a newer plain torch on PyPI can win over the +cuXXX
-  # build from the chosen index. The verify step below prints what was actually installed,
-  # which is where you check that.
+  # best-match used to mean a newer plain torch on PyPI could win over the +cuXXX build
+  # from the chosen index; the explicit pins above are what close that off, so the two
+  # flags no longer fight each other.
   uv pip install \
     --index-url "$torch_index" \
     --extra-index-url https://pypi.org/simple \
     --index-strategy unsafe-best-match \
-    torch torchvision
-  ok "installed from $torch_index (+ PyPI for the nvidia runtime wheels)"
+    "${pins[@]}"
+  ok "installed ${pins[*]} from $torch_index (+ PyPI for the nvidia runtime wheels)"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +268,15 @@ gpu = torch.cuda.is_available()
 print(f"    torch {torch.__version__}  cuda build {torch.version.cuda}  "
       f"cuda available {gpu}")
 if torch.version.cuda and not gpu:
-    bad.append("torch has a CUDA build but cannot see a device -- check the driver")
+    # "check the driver" was the whole message here, and it sends you to the one thing you
+    # usually cannot change (a container does not own its driver). The actionable half is
+    # the other side of the same mismatch: if nvidia-smi sees the card, the wheel is newer
+    # than the driver allows, so the fix is a lower index. CUDA 13 wheels need a 580+
+    # driver; every 12.x wheel runs on 525+ via minor-version compatibility.
+    bad.append(
+        f"torch is a CUDA {torch.version.cuda} build but cannot see a device. If "
+        f"nvidia-smi lists the GPU, the driver is older than this wheel needs -- pick a "
+        f"lower index rather than chasing the driver, e.g. CUDA=cu124 ./setup.sh")
 if gpu:
     print(f"    device: {torch.cuda.get_device_name(0)}, "
           f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
