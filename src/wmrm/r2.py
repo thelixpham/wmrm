@@ -613,11 +613,19 @@ def upload(path: Path | str, key: str, *, bucket: str | None = None,
                 cli.put_object(Bucket=bucket, Key=key, Body=f, ContentType=ctype)
         except Exception as exc:                        # noqa: BLE001
             raise R2Error(_explain(exc, bucket, key)) from exc
-        if progress:
-            _log(f"[r2] uploaded {path.name} ({_human(size)}) in one request -> {key}")
+        # Not gated on `progress`. That flag is about the live percentage line, not about
+        # whether anything is said at all -- `download` has always logged its start and
+        # finish unconditionally, and the asymmetry meant a caller passing progress=False
+        # (the server does) saw the fetch and heard nothing about the publish. "Did the
+        # result actually land?" is not a progress detail.
+        _log(f"[r2] uploaded {path.name} ({_human(size)}) in one request -> {key}")
         return key
 
     plan = _plan_parts(size, part)
+    # Said before the work, symmetrically with `download`: a multipart upload of tens of
+    # gigabytes is long enough that "it started" and "it finished" are different facts.
+    _log(f"[r2] {path.name} ({_human(size)}) -> {key}")
+    _log(f"[r2] {len(plan)} parts of {_human(part)}, {workers} workers")
     try:
         upload_id = _find_open_upload(cli, bucket, key)
         keep: dict[int, str] = {}
@@ -681,8 +689,7 @@ def upload(path: Path | str, key: str, *, bucket: str | None = None,
     except Exception as exc:                            # noqa: BLE001
         raise R2Error(_explain(exc, bucket, key)) from exc
 
-    if progress:
-        _log(f"[r2] uploaded {path.name} ({_human(size)}) in {len(plan)} parts -> {key}")
+    _log(f"[r2] uploaded {path.name} ({_human(size)}) in {len(plan)} parts -> {key}")
     return key
 
 

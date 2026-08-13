@@ -29,6 +29,7 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,18 @@ from .transfer import (NotEnoughSpace, TransferError, abort_r2, download, pull_r
 
 #: Grace between asking the process group to stop and insisting.
 TERM_GRACE = 30.0
+
+
+def _say(job_id: str, message: str) -> None:
+    """One line to the server's own log, so the console is not silent for hours.
+
+    The run's own output goes to a file rather than here -- a nine-hour job produces far
+    more than is sensible to keep in memory or scroll past. But that left the console
+    showing the R2 download (which happens in this process) and then nothing at all, so
+    there was no way to tell a working job from a wedged one without going to look for a
+    file. These lines are the lifecycle only: what state it moved to, and how it ended.
+    """
+    print(f"[job {job_id}] {message}", file=sys.stderr, flush=True)
 
 #: Report outcome -> the state this pod publishes.
 #
@@ -206,15 +219,25 @@ class JobRunner:
         log_path = job_dir / "run.log"
         hb: asyncio.Task | None = None
         try:
+            _say(spec.jobId, f"accepted: engine={spec.engine} input={spec.input.kind}"
+                             f"{'' if spec.box else ' (no box -- the pod will detect one)'}")
             src = await self._stage_input(spec, rec, job_dir, notifier)
             dst, output_key_plan = self._plan_output(spec, job_dir, src)
+            _say(spec.jobId,
+                 f"source ready: {src.name} -> {dst.name}"
+                 + (f", publishing to {output_key_plan}" if output_key_plan
+                    else " (staying on disk -- no R2 output)"))
             # Recorded now so `GET /jobs/{id}` can say where the result is going before it
             # gets there, and so a cleanup knows what to abort if this run dies.
             rec.set(plannedOutputKey=output_key_plan, outputPath=str(dst))
 
             rec.set_state("running", phase="running")
             hb = asyncio.create_task(self._heartbeat(spec, rec, dst, notifier))
+            started = time.time()
             code = await self._spawn(spec, rec, src, dst, report_path, log_path)
+            _say(spec.jobId,
+                 f"wmrm run exited {code} after {time.time() - started:.0f}s "
+                 f"-- full output in {log_path}")
 
             report = self._read_report(report_path)
             outcome = self._decide_outcome(rec, report, code)
@@ -247,11 +270,23 @@ class JobRunner:
             )
             if hb is not None:
                 hb.cancel()
-            await notifier.terminal(
+
+            detail = (rec.data.get("error") or {}).get("message") or ""
+            _say(spec.jobId,
+                 f"{state} (outcome={outcome})"
+                 + (f" -> {output_key}" if output_key else "")
+                 + (f" -- {detail[:160]}" if detail else ""))
+
+            sent = await notifier.terminal(
                 job_id=spec.jobId, dispatch_token=spec.dispatchToken,
                 state=state, outcome=outcome, report=report,
                 error=rec.data.get("error"), output_key=output_key,
             )
+            if not sent and notifier.enabled:
+                # Worth saying out loud: the work is finished and correct, but whoever
+                # dispatched it does not know, so they will see a stalled job until they poll.
+                _say(spec.jobId, "WARNING: could not report the result back. "
+                                 "The state above is on disk; the caller has not been told.")
 
         except asyncio.CancelledError:                  # pragma: no cover
             raise
@@ -452,12 +487,22 @@ class JobRunner:
         indistinguishable from a dead pod.
         """
         interval = max(5, spec.heartbeatEverySeconds)
+        # Progress is only echoed to the console when it moves, and at most once a minute.
+        # A line every 30 seconds saying the same thing is how a log stops being read.
+        last_echo, last_done = 0.0, -1
         while True:
             try:
                 await asyncio.sleep(interval)
                 progress = self._progress(spec, dst)
                 if progress is not None:
                     rec.set(progress=progress)
+                    done = int(progress.get("partsDone") or 0)
+                    if done != last_done and time.time() - last_echo > 60:
+                        total, eta = progress.get("partsTotal"), progress.get("etaSeconds")
+                        _say(spec.jobId,
+                             f"{done}/{total if total else '?'} parts"
+                             + (f", ~{eta // 60} min left" if eta else ""))
+                        last_echo, last_done = time.time(), done
                 fresh = self._record(spec.jobId) or rec
                 await notifier.heartbeat(
                     job_id=spec.jobId, dispatch_token=spec.dispatchToken,
