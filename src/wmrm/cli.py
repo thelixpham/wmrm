@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import traceback
 from dataclasses import replace
@@ -16,9 +17,13 @@ from pathlib import Path
 
 from . import __version__
 from .detect import DetectError, detect, write_preview
+from .errors import (CoverageInconclusive, CoverageUnder, InputMissing, UsageError,
+                     WmrmError)
+from .lock import output_lock
 from .pipeline import EncodeError, EncodeOpts, run_fast, run_inpaint
 from .probe import ProbeError, ToolMissing, probe
 from .region import CORNERS, Box, Preset
+from .report import ReportWriter, RunContext
 from .verify import verify as run_verify
 
 VIDEO_SUFFIXES = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
@@ -33,7 +38,7 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
                     ) -> tuple[Box, Preset]:
     """Return the box to use plus the knobs, from --box, --preset or --detect."""
     if args.box and args.preset:
-        raise SystemExit("error: pass either --box or --preset, not both")
+        raise UsageError("pass either --box or --preset, not both")
     # No box, no preset -> detect. This used to be an error telling you to pass one of
     # three flags, which is the right default only if an accidental unattended guess is
     # the worst outcome. It no longer is: a detected box is now checked by the coverage
@@ -44,8 +49,8 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
     # A named --preset or --box still wins, and still skips detection entirely.
     if not args.box and not args.preset and not getattr(args, "detect", False):
         if src is None:
-            raise SystemExit(
-                "error: need --box x,y,w,h or --preset wm.json here (this command "
+            raise UsageError(
+                "need --box x,y,w,h or --preset wm.json here (this command "
                 "cannot detect, it has no video to look at)"
             )
         args.detect = True
@@ -57,7 +62,7 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
         preset = Preset.from_box(box, width, height)
     elif not args.preset and getattr(args, "detect", False):
         if src is None:
-            raise SystemExit("error: --detect needs an input file")
+            raise UsageError("--detect needs an input file")
         # Detection is a guess with measured failure modes, so a preview is
         # always written and every processed file still goes through the usual
         # verification. If detection finds nothing it raises, which aborts the
@@ -104,14 +109,14 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
     elif args.preset:
         path = Path(args.preset)
         if not path.exists():
-            raise SystemExit(
-                f"error: preset {path} not found. Create it with:\n"
+            raise UsageError(
+                f"preset {path} not found. Create it with:\n"
                 f"  wmrm detect YOUR.mp4 --preset {path}"
             )
         preset = Preset.load(path).scaled_px(width, height)
         box = preset.box_for(width, height)
     else:                                    # pragma: no cover -- unreachable now
-        raise SystemExit("error: could not work out which box to use")
+        raise UsageError("could not work out which box to use")
 
     overrides = {
         f"{name}_px": getattr(args, name)
@@ -123,13 +128,27 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
     return box, preset
 
 
+def _box_source(args) -> str:
+    """Where the box came from, for the report. Derived, so it cannot disagree."""
+    if getattr(args, "box", None):
+        return "given"
+    if getattr(args, "preset", None):
+        return "preset"
+    return "detect"
+
+
 def _log_config(src: Path, dst: Path, info, box: Box, preset: Preset, args,
-                backend) -> None:
+                backend) -> RunContext:
     """Print the effective configuration once, before any frames are touched.
 
     Mostly so a wrong device is impossible to miss: the CPU-only torch wheel on a
     GPU machine runs 20-50x slower and produces byte-identical output, so nothing
     downstream reveals the mistake.
+
+    Returns what it worked out as well as printing it. The engine label, the resolved
+    device and the tile size used to exist only inside these f-strings, so anything
+    that needed them -- the report, and through it the service -- had to recompute them
+    and could end up disagreeing with the banner the operator read.
     """
     from .region import build_region
 
@@ -176,6 +195,13 @@ def _log_config(src: Path, dst: Path, info, box: Box, preset: Preset, args,
           "trace of the mark can remain")
     p(f"[cfg] encode   : libx264 crf {args.crf} preset {args.x264_preset}, "
       f"audio copy")
+
+    return RunContext(
+        info=info, box=box, tile=region.tile,
+        engine=args.quality, engine_label=engine,
+        device=getattr(args, "device", "auto"), device_label=where,
+        box_source=_box_source(args),
+    )
 
 
 def _default_output(src: Path) -> Path:
@@ -224,7 +250,7 @@ def _process_one(src: Path, dst: Path, box: Box, preset: Preset, args, backend):
 
 
 def _make_backend(args, *, src: Path | None = None, box: Box | None = None,
-                  preset: Preset | None = None):
+                  preset: Preset | None = None, report=None):
     # Both of these own their whole clip: `fast` is one ffmpeg graph, `video` is a
     # sequence model that needs many frames at once. Neither fits the per-frame
     # Backend interface, so there is nothing to build here.
@@ -235,8 +261,13 @@ def _make_backend(args, *, src: Path | None = None, box: Box | None = None,
     fitted = None
     if args.quality == "unblend":
         if src is None or box is None or preset is None:
-            raise SystemExit("error: --quality unblend needs an input file and a box")
+            raise UsageError("--quality unblend needs an input file and a box")
         fitted = _fit_unblend(src, box, preset, samples=args.unblend_samples)
+        # The fit is the only place these numbers exist, and `residual` is the line that
+        # actually says whether removal worked. Hand them to the report on the way past
+        # rather than recomputing or, worse, leaving the caller to parse the banner.
+        if report is not None:
+            report.set_unblend(fitted)
 
     return make_backend(args.quality, threads=args.threads,
                         cache_tolerance=args.cache_tolerance,
@@ -348,30 +379,172 @@ def cmd_detect(args) -> int:
     return 0
 
 
+def _install_signal_handlers() -> None:
+    """Turn SIGTERM into an exception so the normal unwinding runs.
+
+    Without this, a `kill` leaves no report, no released lock and orphaned ffmpeg
+    children -- the default disposition tears the process down without running any
+    `finally`. Raising KeyboardInterrupt instead means the same path that handles Ctrl-C
+    handles being stopped by a supervisor, which is the case that actually happens in
+    production when a pod is restarted mid-run.
+
+    SIGINT already raises; it is re-registered only so both signals report identically.
+    """
+    def _raise(signum, _frame):                      # noqa: ANN001
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _raise)
+        except (ValueError, OSError):                 # pragma: no cover
+            # Not the main thread, or a platform without it. Not worth failing over.
+            pass
+
+
+def _run_coverage_gate(src: Path, box: Box, mode: str, report) -> None:
+    """Check the box covers the whole mark, before a single frame is processed.
+
+    `run` did not do this before -- only `batch` did, and only when it had detected the
+    box itself. That left the most common invocation unguarded against the one failure
+    that matters: a box a few pixels too small ships a video with watermark fringe still
+    in it, and nothing downstream notices.
+
+    Only `strict` stops, and it is not the default -- see the flag's definition for the
+    measurement behind that. `warn` reports the same verdict and carries on, which keeps
+    every existing invocation behaving as it did while still putting the verdict in the
+    report where a caller can act on it.
+    """
+    if mode == "off":
+        return
+
+    from .coverage import check_coverage
+
+    cov = check_coverage(src, box)
+    print(cov.describe(), file=sys.stderr)
+    if report is not None:
+        report.set_coverage(cov)
+
+    if mode == "warn":
+        # Asked for explicitly, which reads as "I have looked and I accept it", so
+        # neither verdict blocks and neither becomes a review item.
+        if not cov.ok:
+            print("[wmrm] --coverage-gate warn: continuing despite the verdict above",
+                  file=sys.stderr)
+        return
+
+    if cov.inconclusive:
+        raise CoverageInconclusive(
+            "coverage INCONCLUSIVE -- the background is static, so no statistic can "
+            "separate mark from wall here. Confirm this one by eye "
+            "(wmrm run --preview-only), then re-run with --coverage-gate warn."
+        )
+    if not cov.ok:
+        s = cov.suggested
+        hint = f" Try --box {s.x},{s.y},{s.w},{s.h}" if s else ""
+        raise CoverageUnder(
+            f"UNDER-COVERED -- the watermark extends outside this box, so processing "
+            f"it would ship a video with fringe left in.{hint}"
+        )
+
+
 def cmd_run(args) -> int:
+    report = ReportWriter(Path(args.report)) if getattr(args, "report", None) else None
+    _install_signal_handlers()
+    try:
+        return _cmd_run_inner(args, report)
+    except BaseException as exc:
+        # BaseException, not Exception: SystemExit and KeyboardInterrupt are the two
+        # that matter most here. A run stopped by a supervisor is exactly the case the
+        # caller needs a report for, and it arrives as KeyboardInterrupt.
+        if report is not None:
+            report.fail(exc)
+        raise                       # re-raised untouched, so exit codes do not change
+    finally:
+        if report is not None:
+            report.flush()          # no-op if the run already said how it ended
+
+
+def _cmd_run_inner(args, report) -> int:
     src = Path(args.input)
     if not src.exists():
-        raise SystemExit(f"error: {src} not found")
+        raise InputMissing(f"{src} not found")
     info = probe(src)
     box, preset = _resolve_region(args, info.width, info.height, src=src)
     dst = Path(args.output) if args.output else _default_output(src)
+    if report is not None:
+        report.set_paths(src, dst)
 
     if args.preview_only:
         out = dst.with_name(f"{src.stem}-boxcheck.png")
         write_preview(src, box, out, zoom_png=out.with_name(f"{src.stem}-boxcheck-zoom.png"))
         print(f"box {box.as_tuple()} drawn on {out}; nothing processed")
+        if report is not None:
+            report.ok(dst=None)
         return 0
 
-    backend = _make_backend(args, src=src, box=box, preset=preset)
-    _log_config(src, dst, info, box, preset, args, backend)
-    _process_one(src, dst, box, preset, args, backend)
+    # Before the lock and before the fit: both cost real time, and a box that fails the
+    # gate is not going to be processed with either of them.
+    _run_coverage_gate(src, box, getattr(args, "coverage_gate", "strict"), report)
 
-    if not args.no_verify:
-        result = run_verify(src, dst, box)
-        print("\n[wmrm] verification:")
-        print(result.render())
-        if not result.ok:
-            return 1
+    with output_lock(dst, enabled=not getattr(args, "no_lock", False)):
+        backend = _make_backend(args, src=src, box=box, preset=preset, report=report)
+        ctx = _log_config(src, dst, info, box, preset, args, backend)
+        if report is not None:
+            report.set_context(ctx)
+        _process_one(src, dst, box, preset, args, backend)
+
+        if not args.no_verify:
+            result = run_verify(src, dst, box)
+            print("\n[wmrm] verification:")
+            print(result.render())
+            if report is not None:
+                report.set_verify(result)
+            if not result.ok:
+                # A verdict, not a crash, so there is no exception to map -- but the
+                # caller still has to be able to tell this apart from a missing input.
+                if report is not None:
+                    report.fail_outcome(
+                        "verify_failed",
+                        "acceptance checks failed: "
+                        + ", ".join(n for n, ok, _ in result.checks if not ok),
+                    )
+                return 1
+    if report is not None:
+        report.ok(dst=dst)
+    return 0
+
+
+def cmd_serve(args) -> int:
+    """Run the pod HTTP API.
+
+    Here rather than telling people a uvicorn command line, because two of the arguments
+    are not optional and a forgotten one fails in an expensive way: `--workers 1`,
+    because job state is per-process and on disk, and `--host 0.0.0.0`, because a RunPod
+    proxy cannot reach a server bound to localhost.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        raise UsageError(
+            "wmrm serve needs the 'serve' extra:\n"
+            "  uv pip install -e '.[serve]'"
+        )
+    from .server.app import create_app
+    from .server.config import Config
+
+    cfg = Config.from_env()
+    if not cfg.token:
+        print("[wmrm] WARNING: WMRM_POD_TOKEN is not set, so every authenticated "
+              "route will refuse with 503. Set it to the token the control plane "
+              "issued for this pod.", file=sys.stderr)
+    print(f"[wmrm] pod {cfg.pod_id}\n"
+          f"[wmrm]   work  : {cfg.work_dir}\n"
+          f"[wmrm]   state : {cfg.state_dir}\n"
+          f"[wmrm]   input : {cfg.local_input_root or '(url only)'}\n"
+          f"[wmrm]   serving on {args.host}:{args.port}", file=sys.stderr)
+
+    uvicorn.run(create_app(cfg), host=args.host, port=args.port,
+                log_level=args.log_level, workers=1)
     return 0
 
 
@@ -455,7 +628,17 @@ def cmd_batch(args) -> int:
     backend = None if detect_each else _make_backend(
         args, src=first_src, box=first_box, preset=first_preset)
 
-    gate = detect_each and not getattr(args, "no_coverage_gate", False)
+    # The gate no longer depends on who chose the box. It used to run only for
+    # --detect-each, on the reasoning that a box a human passed in had already been
+    # confirmed -- but a box measured on one file and applied to fifty is exactly the
+    # case where one of the fifty is cropped differently, and checking it costs one
+    # sampling pass against hours of processing.
+    gate_mode = getattr(args, "coverage_gate", "strict")
+    if getattr(args, "no_coverage_gate", False):
+        print("[wmrm] --no-coverage-gate is deprecated; use --coverage-gate off",
+              file=sys.stderr)
+        gate_mode = "off"
+    gate = gate_mode != "off"
     failures: list[str] = []
     blocked: list[str] = []
     unverified: list[str] = []
@@ -480,16 +663,28 @@ def cmd_batch(args) -> int:
                     # The background is static, so no statistic separates mark from
                     # wall. Not a reason to refuse the work -- a reason to say so and
                     # list it again at the end.
+                    #
+                    # `run` stops here instead, and the difference is intended: it
+                    # processes one file for a caller that can wait for a human, while
+                    # a folder of fixed-camera clips would otherwise refuse every file
+                    # and produce nothing. Same signal, different cost of being wrong.
                     print(f"[wmrm] {src.name}: coverage INCONCLUSIVE -- processing, "
                           f"confirm this one by eye", file=sys.stderr)
                     unverified.append(src.name)
                 elif not cov.ok:
                     s = cov.suggested
                     hint = (f" Try --box {s.x},{s.y},{s.w},{s.h}" if s else "")
-                    print(f"[wmrm] SKIPPED {src.name}: the detected box is too small, "
-                          f"the watermark extends outside it.{hint}", file=sys.stderr)
-                    blocked.append(src.name)
-                    continue
+                    if gate_mode == "warn":
+                        print(f"[wmrm] {src.name}: box is too small but "
+                              f"--coverage-gate warn was asked for, processing "
+                              f"anyway.{hint}", file=sys.stderr)
+                        unverified.append(src.name)
+                    else:
+                        print(f"[wmrm] SKIPPED {src.name}: the detected box is too "
+                              f"small, the watermark extends outside it.{hint}",
+                              file=sys.stderr)
+                        blocked.append(src.name)
+                        continue
 
             per_file_backend = backend
             if detect_each:
@@ -697,6 +892,28 @@ def _add_detect_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_run_args(p: argparse.ArgumentParser) -> None:
+    # On both `run` and `batch`, because both are commands that spend hours on a box.
+    #
+    # `warn` is the default, not `strict`, and that is a measurement rather than a
+    # preference. `check_coverage` false-positives on this project's own reference
+    # fixture: measured on tests/fixtures/detail-marked.mp4, both the box the README
+    # uses for its smoke test (379,427,91,43) and the fixture's ground-truth badge
+    # (384,430,84,36) come back UNDER-COVERED with only 1.29% and 1.74% of ring pixels
+    # flagged -- the `detail` fixture puts the badge on dense static texture, which is
+    # the inflating case coverage.py's own docstring warns about. A `strict` default
+    # would turn a documented, working invocation into a hard failure.
+    #
+    # So the CLI reports and continues; the caller that needs a hard stop asks for one.
+    # The service does, because there a blocked job is reviewable by a human and an
+    # unnoticed watermark fringe is not.
+    p.add_argument("--coverage-gate", choices=("strict", "warn", "off"),
+                   default="warn",
+                   help="check the box covers the whole mark before processing. "
+                        "warn (default) = report the verdict and process anyway; "
+                        "strict = stop if the mark reaches outside the box, or if the "
+                        "check cannot tell (use this for unattended runs); off = skip "
+                        "the check. The check is one sampling pass, so it is not a "
+                        "speed lever")
     p.add_argument("--detect", action="store_true",
                    help="find the watermark and process in one go, no preset needed. "
                         "For 'batch' it detects once on the first file and applies "
@@ -857,6 +1074,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--preview-only", action="store_true",
                    help="draw the box on a frame and exit without processing")
     r.add_argument("--no-verify", action="store_true", help="skip the acceptance checks")
+    r.add_argument("--report", default=None, metavar="FILE",
+                   help="write a JSON result to FILE -- written on every exit path, "
+                        "including failures. This is how a caller learns WHICH failure "
+                        "happened: the exit status cannot say, because 1 today means "
+                        "any of a missing input, a usage mistake, an ffmpeg error and "
+                        "failed verification")
+    r.add_argument("--no-lock", action="store_true",
+                   help="skip the per-output lock. Only for a case where two runs must "
+                        "share an output path, which is not a case that exists yet")
     _add_region_args(r)
     _add_run_args(r)
     r.set_defaults(func=cmd_run)
@@ -936,6 +1162,14 @@ def build_parser() -> argparse.ArgumentParser:
     pull.add_argument("--quiet", action="store_true", help="no progress line")
     pull.set_defaults(func=cmd_pull)
 
+    s = sub.add_parser("serve", help="run the pod HTTP API (needs the 'serve' extra)")
+    s.add_argument("--host", default="0.0.0.0",
+                   help="default 0.0.0.0 -- a RunPod proxy cannot reach localhost")
+    s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--log-level", default="info",
+                   choices=("critical", "error", "warning", "info", "debug", "trace"))
+    s.set_defaults(func=cmd_serve)
+
     v = sub.add_parser("verify", help="compare an original and a processed file")
     v.add_argument("original")
     v.add_argument("processed")
@@ -949,7 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (ToolMissing, ProbeError, DetectError, EncodeError,
+    except (WmrmError, ToolMissing, ProbeError, DetectError, EncodeError,
             ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

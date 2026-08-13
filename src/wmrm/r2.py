@@ -32,7 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-__all__ = ["Creds", "R2Error", "download", "parse_uri", "stat"]
+__all__ = ["Creds", "R2Error", "abort_uploads", "download", "ls", "parse_uri",
+           "stat", "upload"]
 
 CHUNK = 64 * 1024 * 1024          # 64 MiB: ~1600 parts at 100 GB, ~350 at 22 GB
 WORKERS = 8
@@ -476,6 +477,234 @@ def _clock(secs: float) -> str:
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# upload
+#
+# This lived in scripts/upload-r2.py, which reached into this module for
+# `_client`, `_explain` and `_human`. That was fine while a person at a terminal
+# was the only caller; it stopped being fine when the pod server needed to push
+# its own output, because a second caller importing another module's privates is
+# how a refactor here turns into a broken worker there. Same code, public door.
+# --------------------------------------------------------------------------- #
+
+MIN_PART = 5 * 1024 * 1024        # S3/R2 floor for every part but the last
+UPLOAD_ATTEMPTS = 5
+
+CONTENT_TYPE = {
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+    ".webm": "video/webm", ".avi": "video/x-msvideo", ".m4v": "video/x-m4v",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".json": "application/json", ".txt": "text/plain", ".log": "text/plain",
+}
+
+
+def _plan_parts(size: int, part: int) -> list[tuple[int, int, int]]:
+    """(part_number, offset, length) for every part. Part numbers start at 1."""
+    if part < MIN_PART:
+        raise R2Error(f"part size must be at least {_human(MIN_PART)}")
+    n = max(1, -(-size // part))
+    return [(i + 1, i * part, min(part, size - i * part)) for i in range(n)]
+
+
+def _find_open_upload(cli, bucket: str, key: str) -> str | None:
+    """An earlier run's multipart upload for this exact key, if one is open.
+
+    R2 keeps these until completed or aborted, which is what makes resume free.
+    Newest last: if several are somehow open, the most recent attempt is the one
+    whose parts match the file about to be sent.
+    """
+    found: list[tuple[object, str]] = []
+    token: dict = {}
+    while True:
+        resp = cli.list_multipart_uploads(Bucket=bucket, Prefix=key, **token)
+        for u in resp.get("Uploads", []):
+            if u["Key"] == key:
+                found.append((u["Initiated"], u["UploadId"]))
+        if not resp.get("IsTruncated"):
+            break
+        token = {"KeyMarker": resp["NextKeyMarker"],
+                 "UploadIdMarker": resp["NextUploadIdMarker"]}
+    if not found:
+        return None
+    found.sort(key=lambda t: t[0])
+    return found[-1][1]
+
+
+def _reusable_parts(cli, bucket: str, key: str, upload_id: str,
+                    plan: list[tuple[int, int, int]]) -> dict[int, str]:
+    """Parts already on R2 worth keeping, as {part_number: etag}.
+
+    Length is the check. A part whose length does not match what this run intends
+    to send for that number came from a different file or a different part size,
+    and completing an upload that mixes the two produces an object of exactly the
+    right length that is silently corrupt -- the one outcome worse than
+    re-uploading.
+    """
+    want = {n: length for n, _, length in plan}
+    keep: dict[int, str] = {}
+    marker: dict = {}
+    while True:
+        resp = cli.list_parts(Bucket=bucket, Key=key, UploadId=upload_id, **marker)
+        for p in resp.get("Parts", []):
+            n = int(p["PartNumber"])
+            if want.get(n) == int(p["Size"]):
+                keep[n] = p["ETag"]
+        if not resp.get("IsTruncated"):
+            break
+        marker = {"PartNumberMarker": resp["NextPartNumberMarker"]}
+    return keep
+
+
+def _send_part(cli, bucket: str, key: str, upload_id: str, path: Path,
+               number: int, offset: int, length: int,
+               counter: _Counter) -> tuple[int, str]:
+    """One UploadPart, retried. Read with pread so workers share no file offset."""
+    last: Exception | None = None
+    for attempt in range(UPLOAD_ATTEMPTS):
+        try:
+            with open(path, "rb") as f:
+                body = os.pread(f.fileno(), length, offset)
+            if len(body) != length:
+                raise R2Error(
+                    f"{path.name} shrank while uploading: wanted {length} bytes at "
+                    f"{offset}, got {len(body)}")
+            resp = cli.upload_part(Bucket=bucket, Key=key, UploadId=upload_id,
+                                   PartNumber=number, Body=body)
+            counter.add(length)
+            return number, resp["ETag"]
+        except Exception as exc:                        # noqa: BLE001 -- retry anything
+            last = exc
+            if attempt < UPLOAD_ATTEMPTS - 1:
+                time.sleep(2 ** attempt)
+    raise R2Error(f"part {number} failed after {UPLOAD_ATTEMPTS} attempts: {last}")
+
+
+def upload(path: Path | str, key: str, *, bucket: str | None = None,
+           creds: Creds | None = None, part: int = CHUNK,
+           workers: int = WORKERS, progress: bool = True) -> str:
+    """Send a local file to R2 and return the key it landed on.
+
+    Resumable in the same sense as `download`: an interrupted run leaves its parts
+    on R2, and calling again with the same arguments reuses the ones whose lengths
+    still match. That is why an interruption does **not** abort the upload -- the
+    parts that landed are the only reason a retry is cheap.
+
+    The cost of that choice is that abandoned parts are billed while appearing in
+    no listing, so something has to clean up eventually: `abort_uploads`.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise R2Error(f"{path} is not a file")
+    bucket, key = parse_uri(key, default_bucket=bucket) if "://" in key else (bucket, key)
+    creds = creds or Creds.from_env(bucket)
+    bucket = bucket or creds.bucket
+    cli = _client(creds, workers=workers)
+
+    size = path.stat().st_size
+    ctype = CONTENT_TYPE.get(path.suffix.lower(), "application/octet-stream")
+
+    # One request is the whole story below the part size. A multipart upload of a
+    # single part adds two round trips and a resumable state nothing needs.
+    if size <= part:
+        try:
+            with open(path, "rb") as f:
+                cli.put_object(Bucket=bucket, Key=key, Body=f, ContentType=ctype)
+        except Exception as exc:                        # noqa: BLE001
+            raise R2Error(_explain(exc, bucket, key)) from exc
+        if progress:
+            _log(f"[r2] uploaded {path.name} ({_human(size)}) in one request -> {key}")
+        return key
+
+    plan = _plan_parts(size, part)
+    try:
+        upload_id = _find_open_upload(cli, bucket, key)
+        keep: dict[int, str] = {}
+        if upload_id:
+            keep = _reusable_parts(cli, bucket, key, upload_id, plan)
+            if keep and progress:
+                done = sum(length for n, _, length in plan if n in keep)
+                _log(f"[r2] resuming {path.name}: {len(keep)}/{len(plan)} parts "
+                     f"already on R2 ({_human(done)})")
+        else:
+            upload_id = cli.create_multipart_upload(
+                Bucket=bucket, Key=key, ContentType=ctype)["UploadId"]
+    except R2Error:
+        raise
+    except Exception as exc:                            # noqa: BLE001
+        raise R2Error(_explain(exc, bucket, key)) from exc
+
+    todo = [(n, off, length) for n, off, length in plan if n not in keep]
+    total = sum(length for _, _, length in todo)
+    counter = _Counter()
+    etags = dict(keep)
+
+    stop = threading.Event()
+    reporter = None
+    if progress and total:
+        started = time.monotonic()
+        reporter = threading.Thread(target=_report,
+                                    args=(counter, total, started, stop), daemon=True)
+        reporter.start()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_send_part, cli, bucket, key, upload_id, path,
+                                   n, off, length, counter)
+                       for n, off, length in todo]
+            for fut in as_completed(futures):
+                n, etag = fut.result()
+                etags[n] = etag
+    except BaseException:
+        # Not aborted, including on Ctrl-C: see the docstring. Say where things
+        # stand so the choice to resume or drop is an informed one.
+        stop.set()
+        if reporter is not None:
+            reporter.join(timeout=1.0)
+        if progress:
+            _log("")
+        _log(f"[r2] interrupted -- {len(etags)}/{len(plan)} parts of {path.name} are "
+             f"on R2. Re-run to finish, or drop them with abort_uploads({key!r}).")
+        raise
+    finally:
+        stop.set()
+        if reporter is not None:
+            reporter.join(timeout=1.0)
+        if progress and total:
+            _log("")
+
+    try:
+        cli.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": [{"PartNumber": n, "ETag": etags[n]}
+                                       for n in sorted(etags)]})
+    except Exception as exc:                            # noqa: BLE001
+        raise R2Error(_explain(exc, bucket, key)) from exc
+
+    if progress:
+        _log(f"[r2] uploaded {path.name} ({_human(size)}) in {len(plan)} parts -> {key}")
+    return key
+
+
+def abort_uploads(key: str, *, bucket: str | None = None,
+                  creds: Creds | None = None) -> int:
+    """Drop every open multipart upload for `key`. Returns how many were dropped.
+
+    Worth running: the parts of an incomplete upload are stored and billed while
+    appearing in no object listing, so nothing draws attention to them.
+    """
+    bucket, key = parse_uri(key, default_bucket=bucket) if "://" in key else (bucket, key)
+    creds = creds or Creds.from_env(bucket)
+    bucket = bucket or creds.bucket
+    cli = _client(creds, workers=1)
+    n = 0
+    try:
+        while (upload_id := _find_open_upload(cli, bucket, key)):
+            cli.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            n += 1
+    except Exception as exc:                            # noqa: BLE001
+        raise R2Error(_explain(exc, bucket, key)) from exc
+    return n
 
 
 # --------------------------------------------------------------------------- #

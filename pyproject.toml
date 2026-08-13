@@ -16,6 +16,25 @@ dependencies = [
 # has its videos locally should not have to install an AWS SDK to inpaint them.
 r2 = ["boto3>=1.34"]
 
+# `wmrm serve` only: the HTTP wrapper a GPU pod runs so jobs arrive over the
+# network instead of over ssh. Kept out of the base install because the machine
+# that processes video and the machine that schedules it are not the same, and a
+# laptop running the CLI has no use for a web framework.
+#
+#
+# boto3 is included: the pod fetches its own source and publishes its own output, so
+# it needs R2 access. The alternative -- presigned URLs minted by the control plane --
+# keeps credentials off the pod but costs a round of URL-refresh plumbing and gives up
+# the parallel, chunk-resumable transfer in `wmrm.r2`. On pods you own, credentials on
+# the pod is the cheaper trade; on pods you do not, revisit it.
+serve = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "boto3>=1.34",
+]
+
 [tool.uv]
 # simple-lama-inpainting 0.1.2 declares upper bounds that its code does not
 # actually need, and the project has been running past all of them: measured in
