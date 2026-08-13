@@ -152,8 +152,28 @@ else
   # torch and torchvision in one command, from one index. Installed separately or from
   # different indexes they resolve to a mismatched pair, and the symptom is
   # `operator torchvision::nms does not exist`, which mentions neither of them.
-  uv pip install --index-url "$torch_index" torch torchvision
-  ok "installed from $torch_index"
+  #
+  # PyPI has to stay in the search set, and this is not optional any more.
+  # `--index-url` REPLACES PyPI rather than adding to it, and the pytorch index has since
+  # pruned the old nvidia wheels: every torch it still serves for cu124 pins
+  # `nvidia-cudnn-cu12==9.1.0.70` exactly, while the oldest cudnn left on that index is
+  # 9.18.0.77. PyPI still has 9.1.0.70. With one index the resolution is genuinely
+  # unsatisfiable, and uv reports it as a pile of unrelated hints about aarch64 wheels and
+  # Python ABI tags that send you looking at your interpreter version instead.
+  #
+  # `unsafe-best-match` is required, not belt-and-braces: uv's default `first-index` stops
+  # at the first index that has the package NAME, and cu124 does have nvidia-cudnn-cu12 --
+  # just not the pinned version. So it would keep failing with PyPI merely listed.
+  #
+  # The cost of best-match is that a newer plain torch on PyPI can win over the +cuXXX
+  # build from the chosen index. The verify step below prints what was actually installed,
+  # which is where you check that.
+  uv pip install \
+    --index-url "$torch_index" \
+    --extra-index-url https://pypi.org/simple \
+    --index-strategy unsafe-best-match \
+    torch torchvision
+  ok "installed from $torch_index (+ PyPI for the nvidia runtime wheels)"
 fi
 
 # --------------------------------------------------------------------------- #
