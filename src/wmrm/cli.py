@@ -532,16 +532,40 @@ def cmd_serve(args) -> int:
     from .server.app import create_app
     from .server.config import Config
 
+    from .server.config import on_pod
+
     cfg = Config.from_env()
     if not cfg.token:
-        print("[wmrm] WARNING: WMRM_POD_TOKEN is not set, so every authenticated "
-              "route will refuse with 503. Set it to the token the control plane "
-              "issued for this pod.", file=sys.stderr)
-    print(f"[wmrm] pod {cfg.pod_id}\n"
+        # The one thing that has to be set. Everything else is derived, so this is the
+        # only reason a start can be "successful" and still serve nothing.
+        print("[wmrm] WMRM_POD_TOKEN is not set, so every route except /live will "
+              "answer 503.\n"
+              "       It is the ONLY required variable. Pick any secret and use the "
+              "same value\n"
+              "       when you register this pod:  export WMRM_POD_TOKEN=...",
+              file=sys.stderr)
+
+    # Built as plain strings, not nested inside the f-strings below: quoting a quote of
+    # the same kind inside an f-string is only legal from Python 3.12, and this package
+    # declares requires-python >= 3.10.
+    where = ("RunPod pod, state on /workspace" if on_pod()
+             else "not a pod (no RUNPOD_POD_ID), state in the cache dir")
+    input_note = str(cfg.local_input_root) if cfg.local_input_root else (
+        "(r2 and url only -- set WMRM_LOCAL_INPUT_ROOT to allow kind=local)")
+    r2_note = cfg.r2_bucket or "(not configured)"
+    if not cfg.r2_configured:
+        r2_note += "  <- kind=r2 jobs will be refused"
+
+    print(f"[wmrm] pod id : {cfg.pod_id}\n"
+          f"[wmrm] machine: {where}\n"
           f"[wmrm]   work  : {cfg.work_dir}\n"
           f"[wmrm]   state : {cfg.state_dir}\n"
-          f"[wmrm]   input : {cfg.local_input_root or '(url only)'}\n"
-          f"[wmrm]   serving on {args.host}:{args.port}", file=sys.stderr)
+          f"[wmrm]   input : {input_note}\n"
+          f"[wmrm]   r2    : {r2_note}\n"
+          f"[wmrm]   disk  : refuse below {cfg.min_free_gb:g} GiB free\n"
+          f"[wmrm]   jobs  : {cfg.max_concurrent} at a time\n"
+          f"[wmrm] serving on {args.host}:{args.port}  (docs at /docs)",
+          file=sys.stderr)
 
     uvicorn.run(create_app(cfg), host=args.host, port=args.port,
                 log_level=args.log_level, workers=1)
