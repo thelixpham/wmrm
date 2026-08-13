@@ -247,6 +247,15 @@ uv pip install --quiet "pillow>=10" opencv-python-headless numpy
 uv pip install --quiet av addict einops future scipy scikit-image imageio \
                        imageio-ffmpeg pyyaml requests timm matplotlib
 uv pip install --quiet boto3
+# The `serve` extra, for `wmrm serve` -- the HTTP wrapper a GPU pod runs so jobs arrive
+# over the network instead of over ssh.
+#
+# Listed here rather than as `-e '.[serve]'` below, because that install is deliberately
+# --no-deps: resolving the project properly would re-resolve torch, and torch is the one
+# package on this machine that was chosen by hand from a specific index. An extra cannot
+# be installed without dependency resolution, so its contents are named here instead.
+# ~10 MB, and installing it everywhere is cheaper than a pod that cannot start its API.
+uv pip install --quiet fastapi 'uvicorn[standard]' httpx pydantic
 ok "dependencies installed"
 
 log "wmrm"
@@ -322,6 +331,27 @@ print(f"    engine device: {describe_device()}")
 for tool in ("ffmpeg", "ffprobe"):
     if not shutil.which(tool):
         bad.append(f"{tool} not on PATH")
+
+# `wmrm serve` imports these lazily and fails at startup, not at install time, so a
+# missing one is invisible until the moment a pod is asked to serve. Checked here so it
+# is caught by setup instead.
+missing = []
+for mod in ("fastapi", "uvicorn", "httpx", "pydantic"):
+    try:
+        __import__(mod)
+    except ImportError:
+        missing.append(mod)
+if missing:
+    bad.append(f"`wmrm serve` cannot start -- missing {', '.join(missing)}. Fix with:"
+               f" uv pip install fastapi 'uvicorn[standard]' httpx pydantic")
+else:
+    from wmrm.server.config import Config, on_pod
+    cfg = Config.from_env()
+    print(f"    serve: ready ({'pod' if on_pod() else 'not a pod'}, "
+          f"work dir {cfg.work_dir})")
+    if not cfg.token:
+        print("    serve: WMRM_POD_TOKEN is unset -- set it before starting the API, "
+              "or every route answers 503")
 
 if bad:
     print()

@@ -102,12 +102,13 @@ wmrm batch ./inbox --preset fanza.json                          # reuse forever
 
 ### Which engine — this is the only real decision
 
-**Must the mark be *completely* gone?** Then `QUALITY=video ./run.sh`. It is the only
-option that gets there. Needs a GPU and a [ProPainter](#complete-removal--quality-video)
-checkout.
+**Must the mark be *completely* gone?** That is `--quality video`, and it is the
+**default**. It is the only option that gets there. Needs a GPU — on CPU it refuses to
+run rather than take 400× longer.
 
-**Is "almost gone, nothing damaged" enough?** Leave the default. No GPU, 34 fps,
-never touches a pixel it was not asked to.
+**Is "almost gone, nothing damaged" enough, or is there no GPU?** Then
+`--quality unblend` (`QUALITY=unblend ./run.sh`). It never touches a pixel it was not
+asked to, and it cannot flicker.
 
 Measured on the reference clip, tile 400×168, background locked-edge floor **12.24**
 (residual at or below that means no watermark is findable any more):
@@ -115,7 +116,7 @@ Measured on the reference clip, tile 400×168, background locked-edge floor **12
 | | residual | corr | detail in the box | GPU |
 |---|---|---|---|---|
 | untouched | 25.60 | 1.00 | — | — |
-| `unblend` (default) | 13.02 | **0.99** | **untouched** | no |
+| `unblend` | 13.02 | **0.99** | **untouched** | no |
 | `high` (LaMa) | 12.42 | 0.68 | **wrecked when leaves cross the box** | wants one |
 | **`video` (ProPainter)** | **11.36** | 0.82 | preserved | **needs one** |
 
@@ -222,8 +223,8 @@ wmrm batch ./inbox --preset fanza.json        # whole folder, skips finished fil
 ```
 
 `run` verifies its own output afterwards (resolution, fps, duration, audio, and
-that the edit stayed local). Leave `--quality` alone unless the mark is opaque —
-the default runs at 34 fps on CPU, so there is nothing to trade away.
+that the edit stayed local). `--quality` defaults to `video`, which needs a GPU; on a
+machine without one, pass `--quality unblend`.
 
 ### More than one watermark?
 
@@ -398,6 +399,7 @@ Install notes, all deliberate:
 | `wmrm batch DIR` | process every video in a directory, skipping finished ones. |
 | `wmrm verify ORIG OUT` | re-run the acceptance checks on an existing pair. |
 | `wmrm pull KEY` | download a source video from Cloudflare R2. Resumable. |
+| `wmrm serve` | run this machine as a job worker over HTTP. See [below](#running-as-a-worker--wmrm-serve). |
 
 `run` and `batch` need either `--preset` or `--box`.
 
@@ -461,11 +463,11 @@ remember one.
 
 `wmrm run --help` lists everything.
 
-### Why `unblend` is the default
+### Why `unblend` is the one to reach for without a GPU
 
 Run `wmrm detect` and look at the `opacity` line. If it says `semi` — the normal
 case — the background is still visible through the mark and can be **recovered**
-rather than invented. That is what the default does; nothing to pass.
+rather than invented. That is what `--quality unblend` does.
 
 A translucent mark is an alpha blend, `C = a*W + (1-a)*B`. Fit `a` and `W` once
 from ~40 sampled frames and every frame is solved back to the real `B`. Inpainting
@@ -743,7 +745,7 @@ Measured on CPU (6 cores). The 1080p column is a real clip with a 284x62 mark:
 
 | | 480x640 | 1080p | 1 minute of 1080p |
 | --- | --- | --- | --- |
-| `unblend` (default) | fast | **34 fps** | **~30 s** |
+| `unblend` | fast | **34 fps** | **~30 s** |
 | `high` (LaMa) | 5.5–7 fps | 1.4 fps | **~22 min** |
 | `video` (ProPainter) | — | **0.27 fps** | **~1.8 h** ← CPU is not an option |
 | `fast` (delogo) | ~realtime | ~realtime | ~1 min |
@@ -787,6 +789,240 @@ applies unchanged to the 1080p cut of the same layout.
 
 ---
 
+---
+
+## Running as a worker — `wmrm serve`
+
+Everything above assumes a person at a terminal. `wmrm serve` is the other mode: this
+machine sits waiting, and jobs arrive over HTTP instead of over ssh.
+
+```bash
+export WMRM_POD_TOKEN=$(head -c 24 /dev/urandom | base64)   # keep this, you paste it later
+echo "token: $WMRM_POD_TOKEN"
+
+wmrm serve --host 0.0.0.0 --port 8000
+```
+
+**That is the only variable you have to set.** Everything else is worked out from the
+machine and printed at startup, so what got chosen is visible rather than remembered:
+
+```
+[wmrm] pod id : abc123
+[wmrm] machine: RunPod pod, state on /workspace
+[wmrm]   work  : /workspace/wmrm-work/abc123
+[wmrm]   state : /workspace/wmrm-state/abc123
+[wmrm]   input : (r2 and url only -- set WMRM_LOCAL_INPUT_ROOT to allow kind=local)
+[wmrm]   r2    : remove-watermark
+[wmrm]   disk  : refuse below 50 GiB free
+[wmrm]   jobs  : 1 at a time
+[wmrm] serving on 0.0.0.0:8000  (docs at /docs)
+```
+
+`--host 0.0.0.0` is the default and it matters: a RunPod proxy cannot reach a server bound
+to localhost. One worker only — job state is per-process and on disk, so a second worker
+would be a second opinion about what this machine is doing.
+
+Needs the `serve` extra, which `./setup.sh` installs. By hand:
+
+```bash
+uv pip install fastapi 'uvicorn[standard]' httpx pydantic
+```
+
+### The token is not optional
+
+The pod's URL is a public address on the internet — `https://<podid>-8000.proxy.runpod.net`
+— and nothing authenticates in front of it. Without a token, anyone who has that URL can
+start jobs on the card you are renting, cancel a nine-hour run, and read the logs.
+
+So an unset token is a **refusal**, not an open door: every route answers 503 and says
+why. A deploy missing its configuration must not look like a working one.
+
+`/live` is the exception. It takes no token so a platform health check can use it, and it
+returns an empty body — there is nothing in it to learn.
+
+### Where to keep it
+
+Any secret will do — it is compared, not parsed:
+
+```bash
+head -c 24 /dev/urandom | base64
+```
+
+`export` alone lasts as long as the shell, which is not long enough. **On a pod, the
+container filesystem is discarded on stop or restart**, so `~/.bashrc`, `/root/.env` and
+anything else outside `/workspace` goes with it — and the pod comes back serving 503 with
+no obvious reason why.
+
+Two places that survive:
+
+- **RunPod's environment variables for the pod** (in its configuration, not in the shell).
+  This is the one to use: the platform re-applies it on every start, so a restart needs
+  nothing from you.
+- **A file on the volume**, if you would rather keep it with the code:
+
+  ```bash
+  echo "export WMRM_POD_TOKEN=$(head -c 24 /dev/urandom | base64)" > /workspace/.wmrm-env
+  chmod 600 /workspace/.wmrm-env
+  # then, each time:
+  source /workspace/.wmrm-env && wmrm serve
+  ```
+
+  Note the quoting: the value is expanded when the file is written, not when it is read.
+
+Leading and trailing whitespace is stripped on both sides, so a stray space from copying
+out of a terminal is not going to cost you an afternoon.
+
+### When the pod and the registry disagree
+
+They are two copies of one secret, so they can drift. The symptom is specific and the
+Pods page shows it verbatim:
+
+> **unhealthy** (HTTP 401) — the pod rejected the token. Check it matches
+> `WMRM_POD_TOKEN` on the pod.
+
+Jobs are not dispatched to a pod in that state, so the failure is visible rather than
+silent. The fix is to re-save the pod with the token it is actually running with.
+
+**Rotating: pod first, registry second.** The other order leaves a window where this app
+calls with a token the pod has already stopped accepting.
+
+```bash
+# 1. on the pod
+export WMRM_POD_TOKEN=<new>          # and update wherever it persists
+wmrm serve                            # restart it
+
+# 2. in the web app: Pods -> that pod -> paste the new token -> Save
+```
+
+Saving re-probes immediately, so you find out on that screen whether the two now agree.
+
+### Environment
+
+| variable | required | default |
+| --- | --- | --- |
+| `WMRM_POD_TOKEN` | **yes** | —. Unset means every route answers 503. |
+| `WMRM_POD_ID` | no | `RUNPOD_POD_ID`, else `local`. Namespaces the work directory. |
+| `WMRM_WORK_DIR` | no | `/workspace/wmrm-work` on a pod, else `~/.cache/wmrm/wmrm-work` |
+| `WMRM_STATE` | no | `/workspace/wmrm-state` on a pod, else `~/.cache/wmrm/wmrm-state` |
+| `WMRM_LOCAL_INPUT_ROOT` | no | unset. Required only for `input.kind: "local"`. |
+| `WMRM_MIN_FREE_GB` | no | 50 on a pod, 2 elsewhere |
+| `WMRM_MAX_CONCURRENT` | no | 1 |
+| `WMRM_WEBHOOK_SECRET` | for reporting | unset. Without it the pod cannot report progress or results, so a job looks stalled to whoever dispatched it. |
+| `CF_ACCESS_CLIENT_ID` / `_SECRET` | if Access guards the callback | unset |
+| `R2_*` | for `kind: "r2"` | unset. See [`wmrm pull`](#getting-the-file--wmrm-pull) — the same four. |
+
+"On a pod" means `RUNPOD_POD_ID` is set **and** `/workspace` is writable. Both, because an
+image can ship the mount point without the volume attached, and because `/workspace`
+turned out to exist — empty and root-owned — on an ordinary workstation image, where
+testing for the directory alone decided "this is a pod" and put the work directory
+somewhere unwritable.
+
+On a pod, everything that must survive a stop or restart has to be under `/workspace`: the
+container filesystem is discarded, taking the venv, the model weights and any job state
+with it.
+
+### The API
+
+Swagger UI at `/docs`, ReDoc at `/redoc`, the schema at `/openapi.json`. **Open — no token.**
+Click **Authorize**, paste the token, and "Try it out" works against the live pod.
+
+The docs are open and the API is not, which is the only arrangement that works: a browser
+cannot attach an `Authorization` header to a URL you type, so putting the docs behind the
+token means `/docs` answers `{"detail":"bad or missing bearer token"}` and the interactive
+docs cannot be reached by the one tool that renders them. It buys little either — the
+routes are `/jobs` and `/health`, guessable in one attempt, and knowing the shape of an API
+gets nobody past the token on the calls that matter. `WMRM_DOCS=off` removes them if you
+would rather not serve them at all.
+
+| | |
+| --- | --- |
+| `GET /live` | 200, no auth, empty body. For a platform health check. |
+| `GET /health` | what this machine is: GPU, `archList`, free disk, engines it can run, R2 configured, jobs in flight |
+| `POST /jobs` | accept a job. **202 in well under a second** — the run itself is a background task |
+| `GET /jobs/{id}` | state, phase, progress, outcome, the run's report |
+| `GET /jobs` | every job this pod knows about. Used to reconcile against whoever dispatched them |
+| `POST /jobs/{id}/cancel` | 202, idempotent |
+| `GET /jobs/{id}/log?tail=N` | the last N lines of stderr. For a human — nothing in the protocol parses it |
+| `DELETE /jobs/{id}` | remove a finished job's state and work directory |
+
+A submission, with the three shapes an input can take:
+
+```jsonc
+{
+  "schema": 1,
+  "jobId": "job_01JBQ7Z8K3M4N5P6Q7R8S9T0V1",
+  "dispatchToken": "dt_9f3c...",
+  "callbackBaseUrl": "https://wmrm.example.com",
+
+  // "r2"    -> the pod fetches the key itself, 8 parallel ranged GETs, resumable
+  // "url"   -> a presigned GET, for a pod holding no credentials
+  // "local" -> already on the volume; must sit under WMRM_LOCAL_INPUT_ROOT
+  "input":  { "kind": "r2", "key": "uploads/3d80.../4K_MOGI-130.mp4" },
+  "output": { "kind": "r2", "key": "output/job_01J.../4K_MOGI-130-clean.mp4" },
+
+  "engine": "video",
+  "box": { "x": 1640, "y": 20, "w": 205, "h": 62 },   // omit and the pod detects one
+  "options": { "device": "cuda" },                     // any run flag, camelCased
+  "heartbeatEverySeconds": 30
+}
+```
+
+`options` takes the run flags by camelCased name — `crf`, `x264Preset`, `ppSegment`,
+`raftIter`, `dilate`, and the detect knobs. The four flags that only exist in the negative
+are sent as positives and inverted on the way through: `"fp16": false` becomes
+`--no-fp16`, and likewise `ppBlackCuts`, `resume`, `verify`.
+
+`coverageGate` defaults to **`strict`** here, unlike the CLI. An unattended run is exactly
+the case that must not ship a maybe: a box the coverage check calls too small fails the
+job, and one it cannot judge sends the job for review rather than guessing.
+
+### What the pod tells you
+
+Every job ends with a webhook to `{callbackBaseUrl}/api/pod/hooks`, signed with
+`WMRM_WEBHOOK_SECRET` over the raw body. Progress arrives the same way, and a **heartbeat
+every 30 seconds regardless of engine** — only ProPainter has countable progress (its
+parts directory), and without a heartbeat every other engine would look dead.
+
+The outcome is not the exit code. Exit 1 already means six unrelated things here, so it
+cannot say which failure happened; the answer travels in the report file (`--report`, and
+`GET /jobs/{id}` returns it). The ones worth knowing apart:
+
+| outcome | what to do |
+| --- | --- |
+| `ok` | nothing |
+| `coverage_under` | the box is provably too small. Fix the box; do not retry as-is |
+| `coverage_inconclusive` | the check could not tell. A person looks |
+| `verify_failed` | the output did not pass its own acceptance checks |
+| `interrupted` | stopped from outside — a pod restart, the OOM killer. **Run it again**; `--resume` picks up finished parts |
+| `canceled` | a person stopped it. Terminal |
+| `upload_failed` | the video is fine and only publishing it failed. Retry costs one upload, not the hours of GPU time |
+| `oom` | the segment did not fit even after ProPainter halved it. A bigger card or a smaller `ppSegment` |
+| `usage_error` | the caller is wrong. Retrying anywhere fails identically |
+
+`interrupted` and `canceled` are deliberately separate. A process cannot tell who sent it
+SIGTERM, so `wmrm run` reports `interrupted` either way and the pod — which knows whether
+it was the one that asked — rewrites it. Collapsing them would mean a job somebody
+cancelled gets retried, or a pod restart quietly loses nine hours of work.
+
+### Registering it
+
+The pod does not announce itself. Bring it up with a token you chose, then paste its URL
+and that same token into the **Pods** page of the web app. Saving probes the machine
+immediately and shows what it found — GPU, `archList`, free disk, `wmrm` version — so a
+wrong URL or a mistyped token is visible then, rather than in a job that fails hours later.
+
+A pod is saved even when the probe fails; its health records why. Refusing to save a
+machine that is merely asleep would mean typing everything again once it wakes up.
+
+### What it does not do
+
+No queue. The pod takes one job at a time and answers **409** when it is busy — deciding
+what runs next is the scheduler's job, and a queue on both sides is two queues to
+disagree. No retries of its own, for the same reason. No cleanup of old work directories
+beyond `DELETE /jobs/{id}`.
+
+---
+
 ## Limits worth knowing before you rely on it
 
 Full measurements in [../REPORT.md](../REPORT.md) §4.
@@ -799,10 +1035,10 @@ changed — the variation is invented. `--patch-hold N` converts boiling into
 freezing rather than fixing it; treat it as a speed lever. A real fix needs
 ProPainter or E2FGVI on a GPU (REPORT.md §5, phase 2).
 
-This is why `unblend` is the default and why an opaque mark is the harder case: the
-default's transform is fitted once and constant, so it has no per-frame guess to
-vary and **cannot** flicker (measured 0.98 correlation with true motion). The
-paragraph above applies only when you leave the default.
+This is why `unblend` is the CPU answer and why an opaque mark is the harder case: its
+transform is fitted once and constant, so it has no per-frame guess to vary and
+**cannot** flicker (measured 0.98 correlation with true motion). The paragraph above
+applies to `high`, `fast` and `draft`, not to `unblend` or `video`.
 
 **Auto-detect breaks when the watermark changes.** It searches for pixel-locked
 *edges*, which is the right signal for some marks and useless for others. Measured

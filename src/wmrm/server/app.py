@@ -13,14 +13,14 @@ Two rules the routes follow:
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .. import __version__
 from .auth import require_token
@@ -39,12 +39,21 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.from_env()
     cfg.ensure_dirs()
 
-    # The docs surfaces are turned off here and re-added below behind the token. FastAPI
-    # would otherwise serve /docs, /redoc and /openapi.json to anyone -- no data in them,
-    # but on a public proxy URL they hand out the exact shape of an API that starts GPU
-    # jobs, which is a free head start for no benefit.
+    # The docs are open; the API is not.
+    #
+    # They were behind the token at first, and that was a mistake with an obvious symptom:
+    # a browser cannot attach an `Authorization` header to a URL you type, so /docs
+    # answered `{"detail":"bad or missing bearer token"}` and the interactive docs could
+    # not be reached by the only tool that renders them. Gating them was not buying much
+    # either -- the routes are `/jobs` and `/health`, guessable in one attempt, and knowing
+    # the shape of an API gets nobody past the token on the calls that matter.
+    #
+    # `WMRM_DOCS=off` removes them for a deployment that would rather not serve them.
+    docs_off = os.environ.get("WMRM_DOCS", "").lower() in ("0", "off", "false", "no")
     app = FastAPI(title="wmrm pod", version=__version__,
-                  docs_url=None, redoc_url=None, openapi_url=None,
+                  docs_url=None if docs_off else "/docs",
+                  redoc_url=None if docs_off else "/redoc",
+                  openapi_url=None if docs_off else "/openapi.json",
                   description=(
                       "HTTP wrapper around `wmrm run` for a GPU pod.\n\n"
                       "Every route except `/live` needs `Authorization: Bearer "
@@ -95,25 +104,6 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         input.key" into an opaque 500.
         """
         return JSONResponse(status_code=400, content={"detail": _flatten(exc.errors())})
-
-    # ------------------------------------------------------------------- docs --
-    #
-    # Behind the token, unlike FastAPI's defaults. Swagger UI itself is fetched from a
-    # CDN by the browser, so only the schema needs authorising.
-
-    @app.get("/openapi.json", include_in_schema=False,
-             dependencies=[Depends(require_token)])
-    async def openapi_schema() -> JSONResponse:
-        return JSONResponse(app.openapi())
-
-    @app.get("/docs", include_in_schema=False, dependencies=[Depends(require_token)])
-    async def swagger_ui() -> HTMLResponse:
-        return get_swagger_ui_html(openapi_url="/openapi.json",
-                                   title="wmrm pod — API")
-
-    @app.get("/redoc", include_in_schema=False, dependencies=[Depends(require_token)])
-    async def redoc_ui() -> HTMLResponse:
-        return get_redoc_html(openapi_url="/openapi.json", title="wmrm pod — API")
 
     # ---------------------------------------------------------------- liveness --
 
