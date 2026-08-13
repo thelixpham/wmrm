@@ -96,13 +96,20 @@ class JobRunner:
     # -- submission ------------------------------------------------------------ #
 
     def resolve_input(self, spec: JobSpec) -> Path | None:
-        """Where the source will be, validating a local path if that is what was asked.
+        """The source's path when it is already on disk, or None when it has to be fetched.
 
         A caller-supplied path is resolved and then required to be inside the configured
         root. Resolving first is the point: checking the string before following symlinks
         accepts `root/../../etc/passwd` and a symlink out of the tree equally.
+
+        Written as "only `local` has a path" rather than "everything except `url` has a
+        path", which is how it started and how it broke: adding the `r2` kind left this
+        function unchanged, so an r2 job fell into the local branch and was rejected for
+        not having WMRM_LOCAL_INPUT_ROOT set -- an error about a field it had not sent.
+        This way a kind added later returns None and fails somewhere that names it, instead
+        of being silently treated as a local path.
         """
-        if spec.input.kind == "url":
+        if spec.input.kind != "local":
             return None
         root = self.cfg.local_input_root
         if root is None:

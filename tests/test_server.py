@@ -325,6 +325,83 @@ def test_capacity_and_idempotency(tmp: Path) -> None:
           dec.stdout.decode()[:60])
 
 
+def test_r2_input_accepted(tmp: Path) -> None:
+    """A `kind: "r2"` job must be accepted on a pod that has credentials.
+
+    The gap this closes: `resolve_input` returned early only for `kind == "url"`, so when
+    the `r2` kind was added every r2 job fell into the local-path branch and was refused
+    for not having WMRM_LOCAL_INPUT_ROOT -- an error about a field the caller never sent.
+    Nothing caught it, because the r2 tests all used a pod *without* credentials, which is
+    refused earlier for a different reason.
+
+    Fake credentials are enough here: `r2_configured` only checks that the four variables
+    are present, and the transfer that would really contact R2 happens in the background
+    after the 202 this asserts on.
+    """
+    print("\n[r2 input accepted]")
+    auth = {"authorization": "Bearer dev-token"}
+
+    saved = {k: os.environ.get(k) for k in
+             ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")}
+    os.environ.update(
+        R2_ACCOUNT_ID="0" * 32,
+        R2_ACCESS_KEY_ID="test-key",
+        R2_SECRET_ACCESS_KEY="test-secret",
+        R2_BUCKET="remove-watermark",
+    )
+    try:
+        client, cfg = make_client(tmp / "r2-in")
+        check("the pod reports R2 configured", cfg.r2_configured is True,
+              str(cfg.r2_reason()))
+
+        with client as c:
+            h = c.get("/health", headers=auth).json()
+            check("/health agrees", h["r2"]["configured"] is True)
+            check("/health names the bucket",
+                  h["r2"]["bucket"] == "remove-watermark", str(h["r2"]["bucket"]))
+
+            # The exact minimal shape the queue sends: no output, no box, no options.
+            r = c.post("/jobs", headers=auth, json={
+                "jobId": "r2_in",
+                "dispatchToken": "dt_x",
+                "callbackBaseUrl": "https://example.invalid",
+                "input": {"kind": "r2", "key": "uploads/abc/clip.mp4"},
+                "engine": "unblend",
+            })
+            check("an r2 input is accepted with 202", r.status_code == 202,
+                  f"{r.status_code} {str(r.json())[:160]}")
+            check("the refusal is not about WMRM_LOCAL_INPUT_ROOT",
+                  "WMRM_LOCAL_INPUT_ROOT" not in str(r.json()),
+                  str(r.json())[:120])
+
+            c.post("/jobs/r2_in/cancel", headers=auth, json={})
+
+        # And the unit that broke: r2 and url must not be treated as local paths.
+        from wmrm.server.config import Config
+        from wmrm.server.models import JobSpec
+        from wmrm.server.runner import JobRunner
+        from wmrm.server.store import JobStore
+
+        cfg2 = Config.from_env()
+        runner = JobRunner(cfg2, JobStore(cfg2.state_dir))
+        for kind, extra in (
+            ("r2", {"key": "uploads/a/b.mp4"}),
+            ("url", {"url": "https://example.invalid/a.mp4"}),
+        ):
+            spec = JobSpec.model_validate({
+                "jobId": f"k_{kind}", "dispatchToken": "dt",
+                "input": {"kind": kind, **extra}, "engine": "unblend",
+            })
+            check(f"resolve_input returns None for kind={kind}",
+                  runner.resolve_input(spec) is None)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_output_omitted(tmp: Path) -> None:
     """An absent `output` must be accepted, and must not be read as a demand for R2.
 
@@ -546,6 +623,7 @@ def main() -> int:
         test_auth(tmp)
         test_health_shape(tmp)
         test_validation(tmp)
+        test_r2_input_accepted(tmp)
         test_output_omitted(tmp)
         test_r2_kinds(tmp)
         test_orphan_adoption(tmp)
