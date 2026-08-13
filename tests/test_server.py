@@ -377,25 +377,42 @@ def test_r2_kinds(tmp: Path) -> None:
                 os.environ[k] = v
 
     # Shape validation happens before any credential check, so it holds either way.
-    from pydantic import ValidationError
+    #
+    # InputSpec/OutputSpec are discriminated unions, not classes, so they are validated
+    # through a TypeAdapter. That is the point of the union: each kind requires only its
+    # own fields, and the schema says so instead of listing every field of every kind.
+    from pydantic import TypeAdapter, ValidationError
 
-    from wmrm.server.models import InputSpec, OutputSpec
-    for spec, kwargs, label in (
-        (InputSpec, {"kind": "r2"}, "input.kind=r2 without key"),
-        (InputSpec, {"kind": "url"}, "input.kind=url without url"),
-        (InputSpec, {"kind": "local"}, "input.kind=local without path"),
-        (OutputSpec, {"kind": "r2"}, "output.kind=r2 without key"),
-        (OutputSpec, {"kind": "local"}, "output.kind=local without path"),
+    from wmrm.server.models import InputR2, InputSpec, OutputSpec
+
+    inputs = TypeAdapter(InputSpec)
+    outputs = TypeAdapter(OutputSpec)
+    for adapter, kwargs, label in (
+        (inputs, {"kind": "r2"}, "input.kind=r2 without key"),
+        (inputs, {"kind": "url"}, "input.kind=url without url"),
+        (inputs, {"kind": "local"}, "input.kind=local without path"),
+        (inputs, {"kind": "nonsense", "key": "x"}, "an unknown input kind"),
+        (outputs, {"kind": "r2"}, "output.kind=r2 without key"),
+        (outputs, {"kind": "local"}, "output.kind=local without path"),
     ):
         try:
-            spec.model_validate(kwargs)
+            adapter.validate_python(kwargs)
             check(f"{label} is rejected", False, "no error")
         except ValidationError:
             check(f"{label} is rejected", True)
 
-    ok = InputSpec.model_validate({"kind": "r2", "key": "uploads/a/b.mp4"})
+    ok = inputs.validate_python({"kind": "r2", "key": "uploads/a/b.mp4"})
+    check("an r2 input resolves to InputR2", isinstance(ok, InputR2))
     check("a bucket override is optional", ok.bucket is None)
     check("the key survives", ok.key == "uploads/a/b.mp4")
+
+    # The variants are genuinely separate: a field from another kind is not accepted just
+    # because it exists somewhere in the union.
+    try:
+        inputs.validate_python({"kind": "r2", "key": "a/b.mp4", "path": "/etc/passwd"})
+        check("a field from another kind is rejected", False, "no error")
+    except ValidationError:
+        check("a field from another kind is rejected", True)
 
 
 def test_orphan_adoption(tmp: Path) -> None:

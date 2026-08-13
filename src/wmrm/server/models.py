@@ -10,7 +10,7 @@ up as slightly wrong pixels.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -67,55 +67,91 @@ class Box(BaseModel):
         return f"{self.x},{self.y},{self.w},{self.h}"
 
 
-class InputSpec(BaseModel):
-    """Where the source comes from.
+# --------------------------------------------------------------------------- #
+# input and output
+#
+# One model per kind, joined by a discriminator, rather than one model with every
+# field of every kind left optional. The flat version validated the same requests,
+# but it documented them wrongly: the generated schema listed key, bucket, url, path,
+# sizeBytes and filename together, so the example payload showed six fields where a
+# real request has one or two, and nothing said which belonged to which kind.
+#
+# Discriminating also moves the "kind=r2 needs key" rules out of a validator and into
+# the types, where the error message names the field instead of the combination.
+#
+# All of them forbid extra keys. Pydantic ignores unknown fields by default, and with a
+# discriminated union that is a trap: `{"kind": "r2", "path": "/etc/passwd"}` would
+# validate, drop the path, and fetch from R2 -- so a caller who picked the wrong kind gets
+# the other kind's behaviour with no complaint. The cost is forward compatibility: a newer
+# control plane that adds a field breaks against an older pod. That is the right way round
+# here, because it breaks loudly and `schema` exists to negotiate the change deliberately.
+# --------------------------------------------------------------------------- #
 
-    `r2` is the normal case: the pod holds R2 credentials and fetches the key itself
-    with `wmrm.r2.download`, which is 8 parallel ranged GETs into a preallocated file
-    with chunk-level resume. That matters at these sizes -- a single-stream download of
-    100 GB is slower by the width of the parallelism, and a transfer that can only
-    start from zero is one that may never finish.
+class Strict(BaseModel):
+    model_config = {"extra": "forbid"}
 
-    `url` (a presigned GET) stays because it is the variant that needs no credentials
-    on the pod at all, and `local` covers a source already staged on the volume.
+
+class InputR2(Strict):
+    """The normal case: the pod fetches the key itself.
+
+    `wmrm.r2.download` is 8 parallel ranged GETs into a preallocated file, resumable at
+    chunk granularity. That matters at these sizes -- one connection is slower by the
+    width of the parallelism, and a transfer that can only start from zero is one that
+    may never finish.
     """
 
-    kind: Literal["r2", "url", "local"]
-    key: str | None = None            # r2
-    bucket: str | None = None         # r2, optional -- defaults to R2_BUCKET
-    url: str | None = None            # url
-    path: str | None = None           # local
-    sizeBytes: int | None = None
+    kind: Literal["r2"] = "r2"
+    key: str = Field(min_length=1, examples=["uploads/3d809a59-.../4K_MOGI-130.mp4"])
+    #: Defaults to the pod's R2_BUCKET.
+    bucket: str | None = None
+
+
+class InputUrl(Strict):
+    """A presigned GET, for a pod that holds no credentials.
+
+    One connection rather than eight, and the URL can expire mid-transfer, so this is
+    the fallback rather than the default.
+    """
+
+    kind: Literal["url"] = "url"
+    url: str = Field(min_length=1)
+    #: Lets the pod check free space before the first byte instead of at 90 GB.
+    sizeBytes: int | None = Field(default=None, ge=0)
     filename: str | None = None
 
-    def model_post_init(self, _ctx: Any) -> None:
-        if self.kind == "r2" and not self.key:
-            raise ValueError("input.kind='r2' needs input.key")
-        if self.kind == "url" and not self.url:
-            raise ValueError("input.kind='url' needs input.url")
-        if self.kind == "local" and not self.path:
-            raise ValueError("input.kind='local' needs input.path")
+
+class InputLocal(Strict):
+    """Already on the volume. Must resolve inside WMRM_LOCAL_INPUT_ROOT."""
+
+    kind: Literal["local"] = "local"
+    path: str = Field(min_length=1)
 
 
-class OutputSpec(BaseModel):
-    """Where the result goes.
+InputSpec = Annotated[
+    Union[InputR2, InputUrl, InputLocal], Field(discriminator="kind")
+]
 
-    `r2` means the pod uploads it itself, multipart and resumable, and reports the key.
-    That removes an entire round of presigned-URL plumbing from the control plane: it
-    does not have to mint part URLs, track an upload id, or expose routes for the pod
-    to call back into.
+
+class OutputR2(Strict):
+    """The pod uploads the result itself and reports the key.
+
+    This removes a whole round of presigned-URL plumbing from the control plane: no part
+    URLs to mint, no upload id to track, no routes for the pod to call back into.
     """
 
-    kind: Literal["r2", "local"]
-    key: str | None = None
+    kind: Literal["r2"] = "r2"
+    key: str = Field(min_length=1, examples=["output/job_01J.../4K_MOGI-130-clean.mp4"])
     bucket: str | None = None
-    path: str | None = None
 
-    def model_post_init(self, _ctx: Any) -> None:
-        if self.kind == "r2" and not self.key:
-            raise ValueError("output.kind='r2' needs output.key")
-        if self.kind == "local" and not self.path:
-            raise ValueError("output.kind='local' needs output.path")
+
+class OutputLocal(Strict):
+    """Leave it on disk. For trying things out without a bucket."""
+
+    kind: Literal["local"] = "local"
+    path: str = Field(min_length=1)
+
+
+OutputSpec = Annotated[Union[OutputR2, OutputLocal], Field(discriminator="kind")]
 
 
 class JobSpec(BaseModel):
@@ -127,10 +163,42 @@ class JobSpec(BaseModel):
     output: OutputSpec
     engine: Engine
     box: Box | None = None
-    options: dict[str, Any] = Field(default_factory=dict)
+    #: Any run flag, camelCased. The four that exist only in the negative on the CLI --
+    #: fp16, ppBlackCuts, resume, verify -- are sent as positives and inverted here.
+    options: dict[str, Any] = Field(
+        default_factory=dict,
+        examples=[{"device": "cuda", "coverageGate": "strict"}],
+    )
     heartbeatEverySeconds: int = Field(default=30, ge=5, le=3600)
 
-    model_config = {"populate_by_name": True}
+    model_config = {
+        "populate_by_name": True,
+        # A worked example, because the generated one is assembled field by field and ends
+        # up showing every optional key at once -- which reads as "all of this is required".
+        # A real request is this short.
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "schema": 1,
+                    "jobId": "job_01JBQ7Z8K3M4N5P6Q7R8S9T0V1",
+                    "dispatchToken": "dt_9f3c2a...",
+                    "callbackBaseUrl": "https://wmrm.example.com",
+                    "input": {
+                        "kind": "r2",
+                        "key": "uploads/3d809a59-.../4K_MOGI-130.mp4",
+                    },
+                    "output": {
+                        "kind": "r2",
+                        "key": "output/job_01JBQ7Z8K3M4N5P6Q7R8S9T0V1/"
+                               "4K_MOGI-130-clean.mp4",
+                    },
+                    "engine": "video",
+                    "box": {"x": 1640, "y": 20, "w": 205, "h": 62},
+                    "options": {"device": "cuda"},
+                }
+            ]
+        },
+    }
 
     @field_validator("jobId")
     @classmethod
