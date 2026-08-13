@@ -153,6 +153,17 @@ class OutputLocal(Strict):
 
 OutputSpec = Annotated[Union[OutputR2, OutputLocal], Field(discriminator="kind")]
 
+#: Where a result goes when the caller does not say.
+#:
+#: `output/<jobId>/<source stem>-clean<ext>`, published to R2 when this pod has
+#: credentials and left in the job's work directory when it does not.
+#:
+#: Derived here rather than required from the caller, because the pod already knows both
+#: halves -- the job id and the source's name -- so asking for it means two places
+#: computing one rule, and the day they disagree the result lands somewhere nobody looks.
+#: A caller that wants to pin the key still can; it just no longer has to.
+OUTPUT_SUFFIX = "-clean"
+
 
 class JobSpec(BaseModel):
     schema_: int = Field(default=1, alias="schema")
@@ -160,8 +171,12 @@ class JobSpec(BaseModel):
     dispatchToken: str = Field(min_length=1, max_length=256)
     callbackBaseUrl: str | None = None
     input: InputSpec
-    output: OutputSpec
+    #: Optional. Absent means `output/<jobId>/<stem>-clean<ext>`, published to R2 if this
+    #: pod has credentials and left in the work directory if not.
+    output: OutputSpec | None = None
     engine: Engine
+    #: Optional. Absent means the pod detects the box itself and gates it -- which is the
+    #: normal path for an unattended queue. Pass one to skip detection entirely.
     box: Box | None = None
     #: Any run flag, camelCased. The four that exist only in the negative on the CLI --
     #: fp16, ppBlackCuts, resume, verify -- are sent as positives and inverted here.
@@ -173,13 +188,26 @@ class JobSpec(BaseModel):
 
     model_config = {
         "populate_by_name": True,
-        # A worked example, because the generated one is assembled field by field and ends
-        # up showing every optional key at once -- which reads as "all of this is required".
-        # A real request is this short.
+        # A worked example, because the generated one is assembled field by field and shows
+        # every optional key at once -- which reads as "all of this is required".
+        #
+        # The first is a real, complete request: four fields. `output` and `box` are absent
+        # because the pod derives one and detects the other, which is the whole point of an
+        # unattended queue. The second shows what pinning them looks like, for the caller
+        # that has a reason to.
         "json_schema_extra": {
             "examples": [
                 {
-                    "schema": 1,
+                    "jobId": "job_01JBQ7Z8K3M4N5P6Q7R8S9T0V1",
+                    "dispatchToken": "dt_9f3c2a...",
+                    "callbackBaseUrl": "https://wmrm.example.com",
+                    "input": {
+                        "kind": "r2",
+                        "key": "uploads/3d809a59-.../4K_MOGI-130.mp4",
+                    },
+                    "engine": "video",
+                },
+                {
                     "jobId": "job_01JBQ7Z8K3M4N5P6Q7R8S9T0V1",
                     "dispatchToken": "dt_9f3c2a...",
                     "callbackBaseUrl": "https://wmrm.example.com",
@@ -189,13 +217,12 @@ class JobSpec(BaseModel):
                     },
                     "output": {
                         "kind": "r2",
-                        "key": "output/job_01JBQ7Z8K3M4N5P6Q7R8S9T0V1/"
-                               "4K_MOGI-130-clean.mp4",
+                        "key": "output/custom/somewhere-else.mp4",
                     },
                     "engine": "video",
                     "box": {"x": 1640, "y": 20, "w": 205, "h": 62},
-                    "options": {"device": "cuda"},
-                }
+                    "options": {"device": "cuda", "coverageGate": "strict"},
+                },
             ]
         },
     }

@@ -190,7 +190,10 @@ class JobRunner:
         hb: asyncio.Task | None = None
         try:
             src = await self._stage_input(spec, rec, job_dir, notifier)
-            dst = self._output_path(spec, job_dir, src)
+            dst, output_key_plan = self._plan_output(spec, job_dir, src)
+            # Recorded now so `GET /jobs/{id}` can say where the result is going before it
+            # gets there, and so a cleanup knows what to abort if this run dies.
+            rec.set(plannedOutputKey=output_key_plan, outputPath=str(dst))
 
             rec.set_state("running", phase="running")
             hb = asyncio.create_task(self._heartbeat(spec, rec, dst, notifier))
@@ -202,7 +205,8 @@ class JobRunner:
             output_key = None
             if outcome == "ok":
                 try:
-                    output_key = await self._deliver_output(spec, rec, dst)
+                    output_key = await self._deliver_output(
+                        spec, rec, dst, output_key_plan)
                 except (TransferError, Exception) as exc:      # noqa: BLE001
                     # The pixels are fine, the delivery is not. Reported as its own
                     # outcome so the control plane retries the upload rather than the
@@ -257,10 +261,15 @@ class JobRunner:
         appearing in no listing, so if this is not done nothing else will notice them --
         but failing the job because the cleanup failed would be worse.
         """
-        if spec.output.kind != "r2" or not spec.output.key:
+        rec = self._record(spec.jobId)
+        key = (rec.data.get("plannedOutputKey") if rec else None) or (
+            spec.output.key if spec.output is not None and spec.output.kind == "r2" else None
+        )
+        if not key:
             return
+        bucket = spec.output.bucket if spec.output is not None else None
         try:
-            await abort_r2(spec.output.key, bucket=spec.output.bucket)
+            await abort_r2(key, bucket=bucket)
         except Exception:                                # noqa: BLE001
             pass
 
@@ -316,31 +325,52 @@ class JobRunner:
                               expected_size=spec.input.sizeBytes or None,
                               on_progress=_tick)
 
-    async def _deliver_output(self, spec: JobSpec, rec: JobRecord, dst: Path) -> str | None:
-        """Put the finished file where the job asked. Returns the key, if any.
+    async def _deliver_output(self, spec: JobSpec, rec: JobRecord, dst: Path,
+                              key: str | None) -> str | None:
+        """Publish the finished file, if there is anywhere to publish it. Returns the key.
 
-        Only reached when the run succeeded. An upload attempted after a failure would
-        publish a file that did not pass verification, which is the one thing the
-        acceptance checks exist to prevent.
+        Only reached when the run succeeded. An upload attempted after a failure would put
+        out a file that did not pass verification, which is the one thing the acceptance
+        checks exist to prevent.
         """
-        if spec.output.kind != "r2":
+        if key is None:
             return None
         if not dst.is_file():
             raise TransferError(f"the run reported success but {dst} is not there")
         rec.set_state("uploading", phase="uploading")
-        return await push_r2(dst, spec.output.key or dst.name,
-                             bucket=spec.output.bucket,
+        bucket = spec.output.bucket if spec.output is not None else None
+        return await push_r2(dst, key, bucket=bucket,
                              workers=self.cfg.r2_workers, progress=False)
 
-    def _output_path(self, spec: JobSpec, job_dir: Path, src: Path) -> Path:
-        if spec.output.kind == "local":
-            path = Path(spec.output.path or "").expanduser()
+    def _plan_output(self, spec: JobSpec, job_dir: Path, src: Path) -> tuple[Path, str | None]:
+        """Where to write it, and the R2 key to publish it under (or None).
+
+        Both derived here, in one place. An absent `output` is the normal case for a queue:
+        the caller has nothing to add, since this side already knows the job id and the
+        source's name. Requiring it would mean the same rule implemented twice, and the day
+        the two disagree the result lands somewhere nobody is looking.
+        """
+        from .models import OUTPUT_SUFFIX
+
+        if spec.output is not None and spec.output.kind == "local":
+            path = Path(spec.output.path).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
-            return path
-        # Named after the R2 key so the file on disk and the object it becomes are
-        # obviously the same thing when someone is looking at both.
-        key = spec.output.key or f"{src.stem}-clean.mp4"
-        return job_dir / Path(key).name
+            return path, None
+
+        if spec.output is not None:                      # kind == "r2", key pinned
+            key = spec.output.key
+            # Named after the key, so the file on disk and the object it becomes are
+            # obviously the same thing to anyone looking at both.
+            return job_dir / Path(key).name, key
+
+        # Nothing asked for. Derive it.
+        name = f"{src.stem}{OUTPUT_SUFFIX}{src.suffix or '.mp4'}"
+        local = job_dir / name
+        if not self.cfg.r2_configured:
+            # No credentials, so there is nowhere to publish to. The file stays here and the
+            # path is reported -- which is the useful answer, not an error.
+            return local, None
+        return local, f"output/{spec.jobId}/{name}"
 
     async def _spawn(self, spec: JobSpec, rec: JobRecord, src: Path, dst: Path,
                      report_path: Path, log_path: Path) -> int:
