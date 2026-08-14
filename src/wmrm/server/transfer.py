@@ -98,11 +98,19 @@ def require_space(path: Path, needed_bytes: int, *, headroom: float = 3.0) -> No
     buried in a comparison.
     """
     path.mkdir(parents=True, exist_ok=True)
-    free = shutil.disk_usage(path).free
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        usage = None
+    # Nothing to compare against is not a refusal. A network work dir that will not answer
+    # `statvfs` would otherwise fail every job on a filesystem with room to spare -- and the
+    # job that really does run out still fails, just later and with its own message.
+    if usage is None or usage.total == 0:
+        return
     needed = int(needed_bytes * headroom)
-    if needed and free < needed:
+    if needed and usage.free < needed:
         raise NotEnoughSpace(
-            f"{path} has {free / 1024**3:.1f} GiB free; this job needs about "
+            f"{path} has {usage.free / 1024**3:.1f} GiB free; this job needs about "
             f"{needed / 1024**3:.1f} GiB (source {needed_bytes / 1024**3:.1f} GiB "
             f"x{headroom:g} for input + parts + output)"
         )

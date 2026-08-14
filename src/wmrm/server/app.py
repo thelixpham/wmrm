@@ -29,10 +29,49 @@ from .hooks import Notifier
 from .models import (CancelAccepted, Health, JobList, JobSpec, JobStatus,
                      SubmitAccepted)
 from .probe import free_gb, probe_machine, vram_free_mb
-from .runner import JobRunner
+from .runner import JobRunner, _say
 from .store import JobStore
 
 STARTED_AT = time.time()
+
+
+def _round_or_none(value: float | None) -> float | None:
+    """Round for display, and let `None` stay `None` all the way to the JSON."""
+    return None if value is None else round(value, 2)
+
+
+def _describe(spec: JobSpec) -> str:
+    """A job request in one line, safe to print.
+
+    Deliberately not `spec.model_dump()`. A `kind: "url"` input carries a presigned URL,
+    which is a credential with hours of life on it -- the status endpoint already leaves
+    `spec` out for that reason, and a log file is no better a place for it than an HTTP
+    response. So the URL is described, never shown.
+    """
+    src = spec.input
+    if src.kind == "r2":
+        where = f"r2:{src.key}"
+    elif src.kind == "local":
+        where = f"local:{src.path}"
+    else:
+        # Host only. Enough to tell "the presigned URL points somewhere unexpected" from
+        # "the download failed", without putting the signature in the log.
+        host = str(src.url).split("/")[2] if "//" in str(src.url) else "?"
+        where = f"url:{src.filename or '?'} via {host}"
+
+    out = "derived"
+    if spec.output is not None:
+        out = f"r2:{spec.output.key}" if spec.output.kind == "r2" else f"local:{spec.output.path}"
+
+    bits = [f"engine={spec.engine}", f"in={where}", f"out={out}"]
+    if spec.box is not None:
+        bits.append(f"box={spec.box.x},{spec.box.y},{spec.box.w},{spec.box.h}")
+    else:
+        bits.append("box=detect")
+    if spec.options:
+        bits.append("opts=" + ",".join(f"{k}={v}" for k, v in sorted(spec.options.items())))
+    bits.append("callback=" + ("yes" if spec.callbackBaseUrl else "NONE -- nothing will be reported"))
+    return "  ".join(bits)
 
 
 def create_app(cfg: Config | None = None) -> FastAPI:
@@ -137,8 +176,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "engines": list(_usable_engines(machine)),
             "capacity": {"maxConcurrent": cfg.max_concurrent,
                          "running": len(store.live())},
+            # `workDirFreeGb` is `null` when the filesystem will not answer, never a
+            # stand-in number: the control plane shows this figure to a person deciding
+            # whether to queue work, and a plausible-looking 0.0 is the one answer that
+            # sends them looking for space they already have.
             "disk": {"workDirPath": str(cfg.work_dir),
-                     "workDirFreeGb": round(free_gb(cfg.work_dir), 2),
+                     "workDirFreeGb": _round_or_none(free_gb(cfg.work_dir)),
                      "minFreeGb": cfg.min_free_gb},
             # Whether this pod can fetch and publish objects itself. The control plane
             # reads this to decide which input/output kinds it may ask for, instead of
@@ -173,6 +216,18 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         store: JobStore = app.state.store
         runner: JobRunner = app.state.runner
 
+        # What was asked for, on the pod's own console, before anything can refuse it.
+        #
+        # A refusal used to leave nothing behind but a status code in the access log -- and
+        # `507` on its own reads like a problem with the request, when it is a fact about
+        # this machine's disk. Both halves are needed to tell those apart: what came in, and
+        # why it was turned away.
+        _say(spec.jobId, f"submit: {_describe(spec)}")
+
+        def refuse(status: int, detail: str) -> HTTPException:
+            _say(spec.jobId, f"REFUSED {status}: {detail}")
+            return HTTPException(status_code=status, detail=detail)
+
         existing = store.get(spec.jobId)
         if existing is not None:
             # Idempotent: the control plane may retry a dispatch whose response was lost,
@@ -190,21 +245,26 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if spec.engine in GPU_ENGINES and not (machine.get("gpu") or {}).get("cuda"):
             # Refused rather than accepted and run at ~400x the cost. Measured: ProPainter
             # on six CPU cores is 0.27 fps, about 1.8 hours per minute of 1080p.
-            raise HTTPException(
-                status_code=400,
-                detail=f"engine '{spec.engine}' needs CUDA and this pod reports none")
+            raise refuse(400,
+                         f"engine '{spec.engine}' needs CUDA and this pod reports none")
 
         if runner.at_capacity():
-            raise HTTPException(
-                status_code=409,
-                detail=f"pod is busy ({cfg.max_concurrent} concurrent job(s) max)")
+            raise refuse(409, f"pod is busy ({cfg.max_concurrent} concurrent job(s) max)")
 
+        # `mkdir` first, for the same reason `require_space` does it: measuring a directory
+        # that does not exist yet raises, and "not created yet" is not "out of space".
+        cfg.work_dir.mkdir(parents=True, exist_ok=True)
         free = free_gb(cfg.work_dir)
-        if free < cfg.min_free_gb:
-            raise HTTPException(
-                status_code=507,
-                detail=f"only {free:.1f} GiB free in {cfg.work_dir}, "
-                       f"need {cfg.min_free_gb:.0f} GiB")
+        if free is None:
+            # Said out loud rather than passed over. A guard that silently stops guarding is
+            # worse than one that is off, because the log still reads as though it ran.
+            _say(spec.jobId, f"disk: {cfg.work_dir} does not report free space "
+                             f"-- the {cfg.min_free_gb:g} GiB floor is not applied. "
+                             f"A full disk will surface as a failed job instead.")
+        elif free < cfg.min_free_gb:
+            raise refuse(507, f"only {free:.1f} GiB free in {cfg.work_dir}, "
+                              f"need {cfg.min_free_gb:.0f} GiB "
+                              f"(raise or lower it with WMRM_MIN_FREE_GB)")
 
         # Refused here rather than discovered by the job. A pod without credentials
         # cannot fetch a key or publish a result, and finding that out after the job is

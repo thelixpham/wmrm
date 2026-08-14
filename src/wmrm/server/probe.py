@@ -123,8 +123,24 @@ def vram_free_mb() -> int | None:
         return None
 
 
-def free_gb(path: Path) -> float:
+def free_gb(path: Path) -> float | None:
+    """Free space at `path` in GiB, or `None` when this machine will not say.
+
+    `None` rather than `0.0`, and the distinction is not pedantic: it is the difference
+    between "the disk is full" and "the question could not be answered", and a caller that
+    refuses on the first must not refuse on the second.
+
+    Measured on a RunPod pod: `/workspace` is MooseFS, a network filesystem, and `statvfs`
+    on it answered 286 TiB one hour and raised the next. Collapsed into `0.0` that read as a
+    disk with nothing left, so every job was turned away with 507 while `df` showed 286 TiB
+    free -- a refusal no amount of freeing space could lift.
+    """
     try:
-        return shutil.disk_usage(path).free / (1024 ** 3)
+        usage = shutil.disk_usage(path)
     except OSError:
-        return 0.0
+        return None
+    # A filesystem that reports no blocks at all is not a full one -- it is one that does
+    # not implement the call. Some FUSE mounts answer this way instead of failing.
+    if usage.total == 0:
+        return None
+    return usage.free / (1024 ** 3)

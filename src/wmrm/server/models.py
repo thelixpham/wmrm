@@ -322,7 +322,9 @@ class Capacity(BaseModel):
 
 class Disk(BaseModel):
     workDirPath: str
-    workDirFreeGb: float
+    # Nullable on purpose: a network work dir may decline to report, and the control plane
+    # has to be able to tell that apart from a disk with nothing left on it.
+    workDirFreeGb: float | None
     minFreeGb: float
 
 
