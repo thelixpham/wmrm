@@ -584,24 +584,49 @@ def test_orphan_adoption(tmp: Path) -> None:
 
 def test_hmac() -> None:
     print("\n[webhook signing]")
-    from wmrm.server.hooks import sign
-
-    body = b'{"a":1}'
-    a = sign("secret", 1700000000, body)
-    b = sign("secret", 1700000000, body)
-    check("signing is deterministic", a == b)
-    check("a different timestamp changes the signature",
-          sign("secret", 1700000001, body) != a)
-    check("a different body changes the signature",
-          sign("secret", 1700000000, b'{"a":2}') != a)
-    check("a different secret changes the signature",
-          sign("other", 1700000000, body) != a)
-
-    # The timestamp is inside the signed string, so it cannot be edited on its own.
     import hashlib
     import hmac as _hmac
-    expect = _hmac.new(b"secret", b"v1:1700000000:" + body, hashlib.sha256).hexdigest()
+
+    from wmrm.server.hooks import WEBHOOK_KEY_LABEL, Notifier, sign, webhook_key
+
+    body = b'{"a":1}'
+    key = webhook_key("pod-token-A")
+    a = sign(key, 1700000000, body)
+
+    check("signing is deterministic", a == sign(key, 1700000000, body))
+    check("a different timestamp changes the signature",
+          sign(key, 1700000001, body) != a)
+    check("a different body changes the signature",
+          sign(key, 1700000000, b'{"a":2}') != a)
+
+    # The property the whole design rests on: a pod cannot sign for another pod, because the
+    # key is derived from its own token rather than from one secret the fleet shares.
+    check("a different pod's token gives a different signature",
+          sign(webhook_key("pod-token-B"), 1700000000, body) != a)
+
+    # Derivation, not reuse: the value that authenticates a call TO the pod and the value
+    # that signs a report FROM it are different bytes.
+    check("the signing key is not the token itself",
+          key != b"pod-token-A" and key != "pod-token-A".encode())
+    check("the key is SHA-256(token || label)",
+          key == hashlib.sha256(b"pod-token-A" + WEBHOOK_KEY_LABEL).digest())
+
+    # The timestamp is inside the signed string, so it cannot be edited on its own.
+    expect = _hmac.new(key, b"v1:1700000000:" + body, hashlib.sha256).hexdigest()
     check("the signed string is v1:{ts}:{body}", a == expect)
+
+    # And the label has to be byte-identical to the web app's, or nothing verifies.
+    check("the label is the agreed constant",
+          WEBHOOK_KEY_LABEL == b"wmrm-webhook-v1", str(WEBHOOK_KEY_LABEL))
+
+    # A notifier with no token cannot sign, so it reports nothing rather than sending
+    # something unsigned.
+    check("a notifier without a pod token is disabled",
+          Notifier(base_url="https://x.invalid", pod_token=None).enabled is False)
+    check("a notifier without a callback url is disabled",
+          Notifier(base_url=None, pod_token="t").enabled is False)
+    check("a notifier with both is enabled",
+          Notifier(base_url="https://x.invalid", pod_token="t").enabled is True)
 
 
 def main() -> int:

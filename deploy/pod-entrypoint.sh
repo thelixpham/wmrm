@@ -51,12 +51,10 @@ appearing to work."
 if [[ -z "${WMRM_POD_TOKEN:-}" ]]; then
   # Not fatal here: the app refuses authenticated routes with 503 and says why, which is
   # a clearer failure than this script exiting before anything is listening.
-  warn "WMRM_POD_TOKEN is not set -- every authenticated route will answer 503.
+  warn "WMRM_POD_TOKEN is not set -- every authenticated route will answer 503, and this
+       pod cannot report progress or results back either, because the key it signs its
+       reports with is derived from this same token.
        Set it to the token the control plane issued for THIS pod."
-fi
-if [[ -z "${WMRM_WEBHOOK_SECRET:-}" ]]; then
-  warn "WMRM_WEBHOOK_SECRET is not set -- this pod cannot report progress or results
-       back, so a job will look stalled to whoever dispatched it."
 fi
 
 # This pod fetches its own source and publishes its own output, so it needs R2 access.

@@ -80,9 +80,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             spec = rec.data.get("spec") or {}
             notifier = Notifier(
                 base_url=spec.get("callbackBaseUrl"),
-                secret=cfg.webhook_secret,
-                access_client_id=cfg.access_client_id,
-                access_client_secret=cfg.access_client_secret,
+                pod_token=cfg.token,
             )
             await notifier.terminal(
                 job_id=rec.job_id,
@@ -231,9 +229,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
         notifier = Notifier(
             base_url=spec.callbackBaseUrl,
-            secret=cfg.webhook_secret,
-            access_client_id=cfg.access_client_id,
-            access_client_secret=cfg.access_client_secret,
+            pod_token=cfg.token,
         )
         rec = runner.submit(spec, notifier)
         return SubmitAccepted(jobId=rec.job_id, state=rec.state,

@@ -75,9 +75,6 @@ class Config:
     work_dir: Path
     state_dir: Path
     local_input_root: Path | None
-    webhook_secret: str | None
-    access_client_id: str | None
-    access_client_secret: str | None
     max_concurrent: int
     min_free_gb: float
     r2_bucket: str | None
@@ -100,9 +97,6 @@ class Config:
             work_dir=_env_path("WMRM_WORK_DIR", base / "wmrm-work") / pod_id,
             state_dir=_env_path("WMRM_STATE", base / "wmrm-state") / pod_id,
             local_input_root=root.resolve() if root else None,
-            webhook_secret=os.environ.get("WMRM_WEBHOOK_SECRET") or None,
-            access_client_id=os.environ.get("CF_ACCESS_CLIENT_ID") or None,
-            access_client_secret=os.environ.get("CF_ACCESS_CLIENT_SECRET") or None,
             # One job at a time. ProPainter materialises a whole segment as a tensor, so
             # two runs on one card is the fastest way to turn a working machine into two
             # out-of-memory failures.

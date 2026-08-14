@@ -1,5 +1,17 @@
 """Reporting back to the control plane.
 
+**The signing key is derived from this pod's own token**, not from a separate shared
+secret. There used to be a `WEBHOOK_SECRET` that had to be configured identically on the
+web app and on every pod, and it was wrong twice over:
+
+- One value on every pod meant any pod could forge another pod's reports.
+- "Must match on both sides" is the quietest possible misconfiguration. A single character
+  out and every report is refused, the job runs correctly, and it looks stalled.
+
+The pod token already satisfies both ends: the pod has it, and the control plane stores it
+(encrypted) because it needs it to call in. So there is nothing to add and nothing to keep
+in sync -- the value that already had to match is the only one there is.
+
 Three properties the receiver depends on, so they are all implemented here rather than
 assumed:
 
@@ -33,26 +45,42 @@ import httpx
 TIMEOUT = 10.0
 MAX_ATTEMPTS = 4
 
+#: Domain separator. The signing key is `SHA-256(token || LABEL)` rather than the token
+#: itself, so the value that authenticates a request *to* this pod and the value that signs
+#: a report *from* it are different bytes. Same root, two purposes, neither reusable as the
+#: other -- which costs nothing here and is the difference between key derivation and key
+#: reuse.
+WEBHOOK_KEY_LABEL = b"wmrm-webhook-v1"
 
-def sign(secret: str, timestamp: int, body: bytes) -> str:
+
+def webhook_key(pod_token: str) -> bytes:
+    """The HMAC key for reports, derived from the pod's bearer token."""
+    return hashlib.sha256(pod_token.encode() + WEBHOOK_KEY_LABEL).digest()
+
+
+def sign(key: bytes | str, timestamp: int, body: bytes) -> str:
+    """HMAC-SHA256 over `v1:{timestamp}:{body}`.
+
+    Takes the already-derived key. Passing a str is accepted so a test can sign with a
+    literal, but the server always passes bytes from `webhook_key`.
+    """
+    raw = key.encode() if isinstance(key, str) else key
     msg = b"v1:" + str(timestamp).encode() + b":" + body
-    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+    return hmac.new(raw, msg, hashlib.sha256).hexdigest()
 
 
 class Notifier:
     """Posts events for one pod. Fire-and-forget by design."""
 
-    def __init__(self, *, base_url: str | None, secret: str | None,
-                 access_client_id: str | None = None,
-                 access_client_secret: str | None = None):
+    def __init__(self, *, base_url: str | None, pod_token: str | None):
         self.base_url = (base_url or "").rstrip("/") or None
-        self.secret = secret
-        self.access_client_id = access_client_id
-        self.access_client_secret = access_client_secret
+        # Derived once. The token itself is not kept, so nothing here can accidentally send
+        # it: this object's job is to sign, not to authenticate outward.
+        self.key = webhook_key(pod_token) if pod_token else None
 
     @property
     def enabled(self) -> bool:
-        return bool(self.base_url and self.secret)
+        return bool(self.base_url and self.key)
 
     async def send(self, payload: dict[str, Any]) -> bool:
         """POST one event, retrying with backoff. Returns whether it landed."""
@@ -67,18 +95,17 @@ class Notifier:
         # Compact and key-order-stable, because this exact byte string is what is signed.
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         ts = int(payload["at"])
+        assert self.key is not None                  # guarded by `enabled` above
         headers = {
             "content-type": "application/json",
-            "x-wmrm-signature": f"v1={sign(self.secret, ts, body)}",
+            "x-wmrm-signature": f"v1={sign(self.key, ts, body)}",
             "x-wmrm-timestamp": str(ts),
             "x-wmrm-dispatch-token": str(payload.get("dispatchToken") or ""),
         }
-        # Present only when Access protects the endpoint with a Service Auth policy. A
-        # service token is how a machine gets through Access at all -- a bearer token of
-        # ours would be rejected at the edge, before this app is reached.
-        if self.access_client_id and self.access_client_secret:
-            headers["cf-access-client-id"] = self.access_client_id
-            headers["cf-access-client-secret"] = self.access_client_secret
+        # No Cloudflare Access credential here. `/api/pod/*` is reached through an Access
+        # **Bypass** policy, and the HMAC above is what authenticates the report -- one
+        # mechanism for one hop rather than two that can disagree. Bypass does not log
+        # the request, so the receiving handler logs it instead.
 
         url = f"{self.base_url}/api/pod/hooks"
         delay = 1.0

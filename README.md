@@ -907,9 +907,9 @@ Saving re-probes immediately, so you find out on that screen whether the two now
 | `WMRM_LOCAL_INPUT_ROOT` | no | unset. Required only for `input.kind: "local"`. |
 | `WMRM_MIN_FREE_GB` | no | 50 on a pod, 2 elsewhere |
 | `WMRM_MAX_CONCURRENT` | no | 1 |
-| `WMRM_WEBHOOK_SECRET` | for reporting | unset. Without it the pod cannot report progress or results, so a job looks stalled to whoever dispatched it. |
-| `CF_ACCESS_CLIENT_ID` / `_SECRET` | if Access guards the callback | unset |
 | `R2_*` | for `kind: "r2"` | unset. See [`wmrm pull`](#getting-the-file--wmrm-pull) — the same four. |
+| `WMRM_ECHO_RUN` / `WMRM_RUN_LOG` | no | see [Watching a run](#watching-a-run) |
+| `WMRM_DOCS` | no | on. `off` removes `/docs`, `/redoc` and `/openapi.json` |
 
 "On a pod" means `RUNPOD_POD_ID` is set **and** `/workspace` is writable. Both, because an
 image can ship the mount point without the volume attached, and because `/workspace`
@@ -1022,7 +1022,7 @@ two hours at 30 fps is about 60 parts.
 ### What the pod tells you
 
 Every job ends with a webhook to `{callbackBaseUrl}/api/pod/hooks`, signed with
-`WMRM_WEBHOOK_SECRET` over the raw body. Progress arrives the same way, and a **heartbeat
+a key derived from this pod's own `WMRM_POD_TOKEN`. Progress arrives the same way, and a **heartbeat
 every 30 seconds regardless of engine** — only ProPainter has countable progress (its
 parts directory), and without a heartbeat every other engine would look dead.
 
@@ -1046,6 +1046,57 @@ cannot say which failure happened; the answer travels in the report file (`--rep
 SIGTERM, so `wmrm run` reports `interrupted` either way and the pod — which knows whether
 it was the one that asked — rewrites it. Collapsing them would mean a job somebody
 cancelled gets retried, or a pod restart quietly loses nine hours of work.
+
+### The secrets, and which side each one lives on
+
+Three, and one of them the project already used. Two values have to match across two
+places, so those are the only ones worth being careful with.
+
+| secret | pod | web | what it proves |
+| --- | :-: | :-: | --- |
+| `WMRM_POD_TOKEN` | ✅ **one per pod** | stored in `pods.token` | **both directions.** web → pod as a bearer token; pod → web as the root of the key its reports are signed with |
+| `CRON_SECRET` | — | ✅ **and on wmrm-cron** | that a sweep really came from the cron Worker. Not Access: the trigger reaches the app over a service binding, which never traverses the edge, so Access never sees it |
+| `R2_*` (four) | ✅ | ✅ | reading the source and publishing the result |
+
+Generate it with hex rather than base64 — the value passes through a RunPod environment
+variable and an HTML form, and base64's `+`, `/` and `=` each have a way of being mangled on
+that trip:
+
+```bash
+openssl rand -hex 24          # WMRM_POD_TOKEN -- a different one per pod
+openssl rand -hex 32          # CRON_SECRET -- the same value on wmrm-service and wmrm-cron
+```
+
+`/api/cron/tick` **refuses to run** when `CRON_SECRET` is unset — 503, not "allow". A sweep
+that cancels jobs on pods is not something to leave reachable by anyone who guesses the
+path, and a half-configured deploy should fail where someone can see it.
+
+**`WMRM_POD_TOKEN` must be different on every pod.** Sharing one means a single compromised
+pod controls all of them, and it would also let any pod sign reports for any other — the
+same reasoning that decides how R2 credentials are handled.
+
+**There is no separate webhook secret**, and that is deliberate. A pod signs its reports
+with `SHA-256(WMRM_POD_TOKEN || "wmrm-webhook-v1")`; the web app looks up which pod owns the
+job, reads that pod's token, and derives the same key. The value that already had to match is
+the only one there is.
+
+That removed two problems rather than one. A fleet-wide shared secret let any pod forge
+another's reports. And "configure this identical value on the web app and on every pod" is
+the quietest misconfiguration available — one character out and every report is refused
+while the job runs perfectly and merely looks stalled.
+
+**The tokens are stored in D1 in the clear**, which was a decision rather than an oversight.
+Hashing them is not available: the control plane has to *send* the token to call the pod, and
+a hash only checks one you were already given. Encrypting them was implemented and then
+removed, because the key would have to live in the same Worker that reads the table — so
+anyone who can read `pods` can read the key, and anyone who can read the Worker's secrets
+can read the table. It bought a third secret to keep in step and no secrecy from anyone. What
+does limit the damage is that each token is a random string, scoped to one pod, used for
+nothing else, and revoked by restarting that pod with a new one.
+
+There is no Cloudflare Access service token here. `/api/pod/*` is reached through an Access
+**Bypass** policy and the HMAC is what authenticates the report — one mechanism for one hop,
+rather than two that can disagree with each other.
 
 ### Registering it
 
