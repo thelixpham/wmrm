@@ -256,14 +256,21 @@ threshold tuning that produced nothing trustworthy, and read the coordinates off
 the picture instead.
 
 **Detect can be made to pick up a second mark in the same corner.** It rejects
-anything not present in ≥90% of sampled frames, which is what stops it boxing
-subtitles — but a studio logo that is not on for the whole film looks identical to
-that rule. Lower it a notch at a time and check each result:
+anything not present in ≥60% of sampled frames, which is what stops it boxing
+subtitles. That was ≥90%, and a studio logo that is not on for the whole film looks
+identical to a subtitle under that rule, so the default now sits low enough to keep
+one. The knob still works in both directions — lower to catch a mark that appears
+in less of the film, higher if the box comes out too big — a notch at a time, and
+check each result:
 
 ```bash
-wmrm run VIDEO.mp4 --persistence 0.5 --preview-only    # look, decide, no processing
-wmrm run VIDEO.mp4 --persistence 0.5                   # detect and process, one command
+wmrm run VIDEO.mp4 --persistence 0.4 --preview-only    # look, decide, no processing
+wmrm run VIDEO.mp4 --persistence 0.4                   # detect and process, one command
 ```
+
+Going lower is not free: subtitles and burnt-in text are exactly what a low
+persistence stops rejecting, and the symptom is a box that suddenly spans much of
+the corner. `--preview-only` first is the cheap way to see it.
 
 Every detect knob — `--corner`, `--samples`, `--roi-frac`, `--grad-threshold`,
 `--persistence`, `--max-area` — works on `run` and `batch`, not just on `detect`,
@@ -767,7 +774,7 @@ cuts its runtime roughly N-fold; read the caveat below first.
 ### Detect options
 
 `--corner tr|tl|br|bl` (default `tr`), `--samples 40`, `--roi-frac 0.30`,
-`--grad-threshold 10`, `--persistence 0.90`, `--max-area 10`.
+`--grad-threshold 10`, `--persistence 0.60`, `--max-area 10`.
 
 All of them are accepted by `run` and `batch` too, which detect on their own when
 given neither `--box` nor `--preset`. There is no detect-then-run pipeline to
@@ -775,9 +782,9 @@ assemble: `wmrm run VIDEO.mp4 [detect knobs]` is that pipeline, and it writes th
 box it used to `<input>-preset.json` on the way through.
 
 Defaults are fine for a corner badge. Lower `--grad-threshold` for a fainter
-watermark, and `--persistence` for a mark that is not on screen the whole film —
-see [More than one watermark?](#more-than-one-watermark) for why that one rejects a
-real logo and how to check the box it gives you instead.
+watermark, and `--persistence` for a mark on screen for even less of the film —
+see [More than one watermark?](#more-than-one-watermark) for what that one starts
+letting through, and how to check the box it gives you.
 
 `wmrm run` with neither `--box` nor `--preset` detects and processes in one command,
 and writes the box it used to `<input>-preset.json`. That file is a record, not an

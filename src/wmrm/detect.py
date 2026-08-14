@@ -172,7 +172,7 @@ def detect(
     samples: int = 40,
     roi_frac: float = 0.30,
     grad_threshold: float | None = None,   # None = sweep
-    persistence: float = 0.90,
+    persistence: float = 0.60,
     max_area_percent: float = 10.0,
     pad: int = 2,
 ) -> Detection:

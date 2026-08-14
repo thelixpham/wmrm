@@ -78,7 +78,7 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
             samples=getattr(args, "samples", 40),
             roi_frac=getattr(args, "roi_frac", 0.30),
             grad_threshold=getattr(args, "grad_threshold", None),
-            persistence=getattr(args, "persistence", 0.90),
+            persistence=getattr(args, "persistence", 0.60),
             max_area_percent=getattr(args, "max_area", 10.0),
         )
         print(det.describe())
@@ -908,12 +908,12 @@ def _add_detect_args(p: argparse.ArgumentParser) -> None:
                         "10 down to 1.5, stopping where the box stops growing -- that "
                         "finds faint marks a fixed threshold misses. Pass a number to "
                         "override")
-    p.add_argument("--persistence", type=float, default=0.90,
+    p.add_argument("--persistence", type=float, default=0.60,
                    help="fraction of sampled frames a pixel must appear in (default "
-                        "0.90). This is what rejects subtitles and temporary text -- "
-                        "and it also rejects a studio logo that is not on screen for "
-                        "the whole film, so lower it when a second mark in the same "
-                        "corner is being missed, and check the box you get")
+                        "0.60). This is what rejects subtitles and temporary text. It "
+                        "was 0.90, which also rejected studio logos that are not on "
+                        "screen for the whole film; raise it back towards 0.90 if the "
+                        "box comes out too big, and check the box either way")
     p.add_argument("--max-area", type=float, default=10.0,
                    help="reject a candidate larger than this %% of the frame (default 10)")
 
