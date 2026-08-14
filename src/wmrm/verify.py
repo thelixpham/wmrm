@@ -40,6 +40,20 @@ class VerifyResult:
         lines.append(f"  => {'all checks passed' if self.ok else 'FAILURES PRESENT'}")
         return "\n".join(lines)
 
+    def to_dict(self) -> dict:
+        """For `--report`.
+
+        Checks become named objects rather than the positional triples used
+        internally: a wire format where the reader has to know that index 1 is the
+        pass flag breaks silently the moment a field is inserted.
+        """
+        return {
+            "ok": self.ok,
+            "checks": [{"name": name, "passed": bool(ok), "detail": detail}
+                       for name, ok, detail in self.checks],
+            "failed": [name for name, ok, _ in self.checks if not ok],
+        }
+
 
 def _psnr(a: np.ndarray, b: np.ndarray) -> float:
     if a.size == 0:

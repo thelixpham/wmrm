@@ -604,6 +604,23 @@ def _fingerprint(src: Path, info, region, opts, encode, part_frames: int) -> dic
     }
 
 
+def build_manifest(fp: dict, cuts: list, frames: int, part_frames: int) -> dict:
+    """What gets written beside the parts.
+
+    `fingerprint` and `cuts` are for resume, and were the whole of this file until the
+    server started reporting progress. `frames` and `part_frames` are for that reader: the
+    number of parts a run will produce is `ceil(frames / part_frames)` -- the same
+    arithmetic `_usable_parts` walks -- and without both numbers written down, the only
+    other way to know the total is to decode the source a second time.
+
+    A function rather than a literal at the call site so the two sides of that contract can
+    be tested against each other. They were not, and drifted: the reader looked for `frames`
+    and `part_frames` while the writer stored neither, so every job reported `partsTotal:
+    null` and could never show a fraction or an ETA.
+    """
+    return {"fingerprint": fp, "cuts": cuts, "frames": frames, "part_frames": part_frames}
+
+
 def _read_manifest(parts_dir: Path) -> dict | None:
     """The record left by an earlier run, or None if there is nothing to trust.
 
@@ -1258,7 +1275,7 @@ def run_propainter(
             stale.unlink(missing_ok=True)
     parts_dir.mkdir(parents=True, exist_ok=True)
     (parts_dir / MANIFEST).write_text(
-        json.dumps({"fingerprint": fp, "cuts": shot_starts}, indent=1))
+        json.dumps(build_manifest(fp, shot_starts, n_total, opts.part_frames), indent=1))
 
     # Where this run has to pick up: the first frame with no finished part behind it.
     resume_from = _usable_parts(parts_dir, n_total, opts.part_frames, say) if prior else 0
