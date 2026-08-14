@@ -109,57 +109,44 @@ log "pod $WMRM_POD_ID"
 mkdir -p "$WMRM_WORK_DIR" "$WMRM_STATE" "$TORCH_HOME"
 
 # ---------------------------------------------------------------------------- #
-# ffmpeg
+# dependencies -- setup.sh, rather than a second copy of it
 # ---------------------------------------------------------------------------- #
-
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  log "installing ffmpeg"
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq && apt-get install -y -qq ffmpeg
-  else
-    die "ffmpeg is missing and this image has no apt-get to install it with"
-  fi
+#
+# This section used to be an abridged re-implementation of setup.sh: install ffmpeg, make
+# a venv, `pip install -e .[serve]`, warn if torch was missing. It drifted, the way a
+# second copy does. setup.sh had a line installing ProPainter's own imports (scipy, av,
+# addict, einops, ...) and this file never grew one, so a pod came up, /health reported
+# a healthy GPU, and the first `video` job died 37 seconds in with `No module named
+# 'scipy'` -- after staging the input and choosing a segment size.
+#
+# So it delegates. setup.sh is idempotent by design -- every step checks before it acts --
+# which is what makes it safe here, in a script that runs again on every restart. VENV
+# points it at the volume rather than next to the repo.
+#
+# **torch included.** This file used to refuse to install it, on the grounds that guessing
+# the wheel is how a cu124 build lands on a Blackwell card and dies at the first kernel
+# launch. But setup.sh does not guess: it reads the driver version *and* the card's
+# compute capability, pins both wheels to what that index really serves, and then checks
+# the resulting arch list against the card. That is strictly better than the warning this
+# file printed in its place -- and the warning was the whole of what it did.
+log "dependencies (setup.sh)"
+setup_status=0
+VENV="$VENV" bash "$REPO/setup.sh" || setup_status=$?
+if (( setup_status != 0 )); then
+  # Not fatal, deliberately. setup.sh exits non-zero when its verification finds a real
+  # problem -- torch that cannot see the card, a missing vendored checkout -- and the
+  # useful thing then is a pod that still serves: /health is what reports the problem,
+  # and the CPU engines do not care about it. Dying here leaves a machine that bills by
+  # the minute and cannot be asked anything.
+  warn "setup.sh exited $setup_status -- see its PROBLEM lines above.
+       Serving anyway: /health reports what this machine can actually run, and
+       unblend/fast/draft are unaffected by a GPU problem."
 fi
-printf 'ffmpeg  : %s\n' "$(command -v ffmpeg)"
 
-# ---------------------------------------------------------------------------- #
-# venv on the volume
-# ---------------------------------------------------------------------------- #
-
-if [[ ! -x "$VENV/bin/python" ]]; then
-  log "creating venv at $VENV"
-  # uv when available (it is much faster and is what the README uses), else stdlib venv.
-  if command -v uv >/dev/null 2>&1; then
-    uv venv "$VENV" --python 3.12
-  else
-    python3 -m venv "$VENV"
-  fi
-fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 printf 'python  : %s\n' "$(python -V 2>&1)"
-
-pip_install() {
-  if command -v uv >/dev/null 2>&1; then
-    VIRTUAL_ENV="$VENV" uv pip install "$@"
-  else
-    python -m pip install -q "$@"
-  fi
-}
-
-# torch is deliberately NOT installed here. The right wheel depends on the card, and
-# guessing produces the worst possible failure: a cu124 wheel on a Blackwell card
-# installs cleanly, reports `cuda (...)`, loads the models, then dies at the first
-# kernel launch. Install it once, for this machine, per the README, and let /health's
-# archList report what you actually got.
-if ! python -c "import torch" >/dev/null 2>&1; then
-  warn "torch is not installed in $VENV.
-       CPU-only engines (unblend/fast/draft) will still work; video and high will not.
-       Install the wheel that matches this card -- see wmrm/README.md 'Install'."
-fi
-
-log "installing wmrm + serve extra"
-pip_install -e "$REPO[serve]" 2>&1 | tail -3 || die "install failed"
+printf 'ffmpeg  : %s\n' "$(command -v ffmpeg || echo 'MISSING')"
 
 # ---------------------------------------------------------------------------- #
 # report what this machine turned out to be

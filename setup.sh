@@ -244,6 +244,11 @@ uv pip install --quiet --no-deps simple-lama-inpainting
 uv pip install --quiet "pillow>=10" opencv-python-headless numpy
 # ProPainter's own imports. It is a research repo with no packaging, so its
 # requirements are ours to satisfy.
+#
+# Not `-r vendor/ProPainter/requirements.txt`, though that file is right there: it also
+# lists torch/torchvision (chosen by hand above, from a specific index) and
+# opencv-python, which ships the same `cv2` as the headless build wmrm depends on --
+# installing both makes whichever landed last win the import. Everything else is its.
 uv pip install --quiet av addict einops future scipy scikit-image imageio \
                        imageio-ffmpeg pyyaml requests timm matplotlib
 uv pip install --quiet boto3
