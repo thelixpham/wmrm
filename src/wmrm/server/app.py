@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from .. import __version__
 from .auth import require_token
 from .config import GPU_ENGINES, Config
-from .hooks import Notifier
+from .hooks import MezonNotifier, Notifier
 from .models import (CancelAccepted, Health, JobList, JobSpec, JobStatus,
                      SubmitAccepted)
 from .probe import free_gb, probe_machine, vram_free_mb
@@ -120,6 +120,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             notifier = Notifier(
                 base_url=spec.get("callbackBaseUrl"),
                 pod_token=cfg.token,
+                mezon=MezonNotifier(cfg.mezon_webhook_url, pod_id=cfg.pod_id),
             )
             await notifier.terminal(
                 job_id=rec.job_id,
@@ -290,6 +291,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         notifier = Notifier(
             base_url=spec.callbackBaseUrl,
             pod_token=cfg.token,
+            mezon=MezonNotifier(cfg.mezon_webhook_url, pod_id=cfg.pod_id),
         )
         rec = runner.submit(spec, notifier)
         return SubmitAccepted(jobId=rec.job_id, state=rec.state,

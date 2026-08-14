@@ -908,6 +908,7 @@ Saving re-probes immediately, so you find out on that screen whether the two now
 | `WMRM_MIN_FREE_GB` | no | 50 on a pod, 2 elsewhere |
 | `WMRM_MAX_CONCURRENT` | no | 1 |
 | `R2_*` | for `kind: "r2"` | unset. See [`wmrm pull`](#getting-the-file--wmrm-pull) — the same four. |
+| `WMRM_MEZON_WEBHOOK_URL` | no | unset. A Mezon channel webhook; see [Telling a person](#telling-a-person-mezon) |
 | `WMRM_ECHO_RUN` / `WMRM_RUN_LOG` | no | see [Watching a run](#watching-a-run) |
 | `WMRM_DOCS` | no | on. `off` removes `/docs`, `/redoc` and `/openapi.json` |
 
@@ -1047,16 +1048,57 @@ SIGTERM, so `wmrm run` reports `interrupted` either way and the pod — which kn
 it was the one that asked — rewrites it. Collapsing them would mean a job somebody
 cancelled gets retried, or a pod restart quietly loses nine hours of work.
 
+### Telling a person (Mezon)
+
+The webhook above is for the control plane. Set `WMRM_MEZON_WEBHOOK_URL` and the pod also
+posts a line to a [Mezon channel webhook](https://mezon.ai/docs/vi/developer/webhooks/channel-webhook)
+when a job ends:
+
+```bash
+export WMRM_MEZON_WEBHOOK_URL='https://webhook.mezon.ai/webhooks/<channelId>/<token>'
+```
+
+Set it in the pod's own environment, alongside the R2 credentials — `pod-entrypoint.sh`
+does not supply a default, deliberately. See the note on the URL below.
+
+```
+✅ wmrm succeeded — ok
+pod: pod-7f3a
+job: 0f2c9b1e
+output: clean/0f2c9b1e.mp4
+```
+
+**Terminal events only** — not heartbeats. Those arrive every 30 seconds for the life of
+the job, and a channel that receives them is a channel everybody mutes.
+
+It is a second destination for one event, not a second reporting path. The message is
+unsigned, carries no dispatch token and no event id, and nothing reads it back; the report
+the control plane acts on is still the signed one. So it is sent **after** that report, two
+attempts and then silence, and every failure is swallowed — a job must not fail because a
+chat channel is gone. When one does not land, the pod says so on its own console:
+
+```
+[job 0f2c9b1e] mezon: notification not delivered
+```
+
+**The URL is the entire credential.** There is no signature and nothing to verify against,
+so anyone holding it can post to that channel — which is why it is not checked in as a
+default, however convenient that would be, and why the startup banner prints
+`mezon : channel 2081597…` and never the token: a pod's console is visible in the RunPod
+dashboard.
+
 ### The secrets, and which side each one lives on
 
-Three, and one of them the project already used. Two values have to match across two
-places, so those are the only ones worth being careful with.
+Three that matter, and one of them the project already used — plus an optional fourth that
+is only held, never matched. Two values have to agree across two places, so those are the
+only ones worth being careful with.
 
 | secret | pod | web | what it proves |
 | --- | :-: | :-: | --- |
 | `WMRM_POD_TOKEN` | ✅ **one per pod** | stored in `pods.token` | **both directions.** web → pod as a bearer token; pod → web as the root of the key its reports are signed with |
 | `CRON_SECRET` | — | ✅ **and on wmrm-cron** | that a sweep really came from the cron Worker. Not Access: the trigger reaches the app over a service binding, which never traverses the edge, so Access never sees it |
 | `R2_*` (four) | ✅ | ✅ | reading the source and publishing the result |
+| `WMRM_MEZON_WEBHOOK_URL` | optional | — | nothing — it *is* the credential. Held, not matched: leaving it unset only means no chat notification |
 
 Generate it with hex rather than base64 — the value passes through a RunPod environment
 variable and an HTML form, and base64's `+`, `/` and `=` each have a way of being mangled on

@@ -48,13 +48,47 @@ appearing to work."
 
 [[ -d "$REPO" ]] || die "no wmrm checkout at $REPO (override with WMRM_REPO)"
 
-if [[ -z "${WMRM_POD_TOKEN:-}" ]]; then
-  # Not fatal here: the app refuses authenticated routes with 503 and says why, which is
-  # a clearer failure than this script exiting before anything is listening.
-  warn "WMRM_POD_TOKEN is not set -- every authenticated route will answer 503, and this
-       pod cannot report progress or results back either, because the key it signs its
-       reports with is derived from this same token.
-       Set it to the token the control plane issued for THIS pod."
+# ---------------------------------------------------------------------------- #
+# token -- generated once, then reused for the life of the volume
+# ---------------------------------------------------------------------------- #
+#
+# The token cannot be regenerated on each boot, and this is the part that is easy to get
+# wrong: the key a pod signs its reports with is DERIVED FROM THIS TOKEN, and the control
+# plane holds the copy that was pasted into /pods. Mint a fresh one on restart and both
+# directions break at once -- dispatch is refused by the pod, and any report it does send
+# is refused by the app -- while /health still answers 200 and the pod looks fine.
+#
+# So it lives on the volume, which is the only thing here that survives a restart, and is
+# namespaced by pod id for the same reason the work and state directories are: two pods
+# sharing a network volume must not share an identity.
+TOKEN_FILE="${WMRM_TOKEN_FILE:-$WMRM_STATE/$WMRM_POD_ID/pod-token}"
+
+if [[ -n "${WMRM_POD_TOKEN:-}" ]]; then
+  # An explicit value wins, always. This is the path for a token the control plane issued
+  # first, and it is not written to the file -- what the operator passes for one boot
+  # should not silently become the default for every boot after it.
+  printf 'token   : from WMRM_POD_TOKEN (env)\n'
+elif [[ -s "$TOKEN_FILE" ]]; then
+  WMRM_POD_TOKEN="$(tr -d '\n' < "$TOKEN_FILE")"
+  export WMRM_POD_TOKEN
+  printf 'token   : reused from %s\n' "$TOKEN_FILE"
+else
+  mkdir -p "$(dirname "$TOKEN_FILE")"
+  # umask in a subshell so the file is 0600 from the moment it exists rather than being
+  # created readable and tightened afterwards.
+  ( umask 077; head -c 24 /dev/urandom | base64 | tr -d '\n' > "$TOKEN_FILE" )
+  WMRM_POD_TOKEN="$(cat "$TOKEN_FILE")"
+  export WMRM_POD_TOKEN
+
+  # Printed once, on the boot that created it, because there is no other way to learn it
+  # and it has to be pasted into the control plane by hand. Later boots print the path
+  # instead -- a pod's console output is visible in the RunPod dashboard, so repeating a
+  # secret there every restart is a cost with no reader.
+  printf '\n\033[1m==> new pod token minted\033[0m\n'
+  printf '    %s\n\n' "$WMRM_POD_TOKEN"
+  printf '    Paste it into the control plane at /pods, together with this endpoint.\n'
+  printf '    Stored at %s -- read it again with:\n' "$TOKEN_FILE"
+  printf '      cat %s\n' "$TOKEN_FILE"
 fi
 
 # This pod fetches its own source and publishes its own output, so it needs R2 access.

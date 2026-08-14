@@ -629,6 +629,96 @@ def test_hmac() -> None:
           Notifier(base_url="https://x.invalid", pod_token="t").enabled is True)
 
 
+class _FakePost:
+    """Stands in for `httpx.AsyncClient`, recording what would have been sent.
+
+    A real request is not wanted here: the URL is a live chat channel, and a test that
+    posts to it is a test nobody can run twice.
+    """
+
+    def __init__(self, status: int = 200, raise_with: Exception | None = None):
+        self.status, self.raise_with = status, raise_with
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, *_a, **_kw):                 # the `AsyncClient(timeout=...)` call
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def post(self, url, **kw):
+        self.calls.append((url, kw))
+        if self.raise_with:
+            raise self.raise_with
+        return type("R", (), {"status_code": self.status})()
+
+
+def test_mezon() -> None:
+    print("\n[mezon notification]")
+    import asyncio
+
+    import httpx
+
+    from wmrm.server.hooks import MezonNotifier, Notifier
+
+    url = "https://webhook.mezon.ai/webhooks/12345/tok-en-value"
+
+    check("no url means disabled", MezonNotifier(None).enabled is False)
+    check("a blank url means disabled", MezonNotifier("   ").enabled is False)
+    check("a url means enabled", MezonNotifier(url).enabled is True)
+
+    # The token is the whole credential, so the startup banner must not carry it.
+    desc = MezonNotifier(url).describe()
+    check("describe names the channel", desc == "channel 12345", desc)
+    check("describe does not leak the token", "tok-en-value" not in desc, desc)
+
+    n = MezonNotifier(url, pod_id="testpod")
+    ok = n.compose(job_id="j1", state="succeeded", outcome="ok",
+                   output_key="out/j1.mp4", error=None)
+    check("a success line is marked and names the output",
+          ok.startswith("✅") and "out/j1.mp4" in ok and "testpod" in ok, repr(ok))
+    bad = n.compose(job_id="j2", state="failed", outcome="verify_failed",
+                    output_key=None, error={"message": "x" * 900})
+    check("a failure line is marked and carries the reason",
+          bad.startswith("❌") and "verify_failed" in bad, repr(bad))
+    check("a long error is truncated", len(bad) < 500, str(len(bad)))
+
+    # The envelope Mezon actually accepts: `type: "hook"` at the root, the text in
+    # `message.t`. Getting either wrong is a 400 that no job would ever surface.
+    fake = _FakePost()
+    real = httpx.AsyncClient
+    httpx.AsyncClient = fake                        # type: ignore[misc]
+    try:
+        landed = asyncio.run(n.terminal(job_id="j1", state="succeeded", outcome="ok"))
+        check("a 2xx counts as delivered", landed is True)
+        sent_url, kw = fake.calls[0]
+        body = kw.get("json") or {}
+        check("it posts to the configured url unchanged", sent_url == url, sent_url)
+        check("the envelope is type=hook with the text in message.t",
+              body.get("type") == "hook" and body.get("message", {}).get("t", "")
+              .startswith("✅ wmrm succeeded"), json.dumps(body))
+
+        # The whole point of the try/except in `Notifier.terminal`: the chat message is
+        # decoration, and a job must not fail because a channel is gone.
+        boom = _FakePost(raise_with=ValueError("boom"))
+        httpx.AsyncClient = boom                    # type: ignore[misc]
+        loud = Notifier(base_url=None, pod_token=None, mezon=n)
+        sent = asyncio.run(loud.terminal(job_id="j3", dispatch_token="d",
+                                         state="failed", outcome="internal",
+                                         report=None, error={"message": "gone"}))
+        check("a broken notifier does not raise", sent is False)
+        check("and it did try", len(boom.calls) == 1)
+    finally:
+        httpx.AsyncClient = real                    # type: ignore[misc]
+
+    # Not configured is the default, and it must stay silent rather than half-send.
+    quiet = Notifier(base_url=None, pod_token=None)
+    check("a notifier without mezon has it disabled", quiet.mezon.enabled is False)
+
+
 def main() -> int:
     if not FIXTURE.is_file():
         print(f"SKIP: {FIXTURE} missing -- run: python tests/make_fixtures.py")
@@ -644,6 +734,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="wmrm-server-test-"))
     try:
         test_hmac()
+        test_mezon()
         test_argv_translation()
         test_auth(tmp)
         test_health_shape(tmp)

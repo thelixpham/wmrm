@@ -79,6 +79,7 @@ class Config:
     min_free_gb: float
     r2_bucket: str | None
     r2_workers: int
+    mezon_webhook_url: str | None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -115,6 +116,11 @@ class Config:
             # 8 is where `wmrm pull` settled: past that the link or the disk saturates
             # first, so more workers only add connections.
             r2_workers=int(os.environ.get("WMRM_R2_WORKERS") or "8"),
+            # Optional, and unset means the pod simply does not announce anything -- the
+            # control plane's webhook is unaffected either way. Kept out of the repo
+            # because the URL *is* the credential: anyone holding it can post to the
+            # channel, and there is nothing else to check.
+            mezon_webhook_url=os.environ.get("WMRM_MEZON_WEBHOOK_URL") or None,
         )
 
     @property

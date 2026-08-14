@@ -531,6 +531,7 @@ def cmd_serve(args) -> int:
         )
     from .server.app import create_app
     from .server.config import Config
+    from .server.hooks import MezonNotifier
 
     from .server.config import on_pod
 
@@ -555,6 +556,7 @@ def cmd_serve(args) -> int:
     r2_note = cfg.r2_bucket or "(not configured)"
     if not cfg.r2_configured:
         r2_note += "  <- kind=r2 jobs will be refused"
+    mezon_note = MezonNotifier(cfg.mezon_webhook_url).describe()
 
     print(f"[wmrm] pod id : {cfg.pod_id}\n"
           f"[wmrm] machine: {where}\n"
@@ -562,6 +564,7 @@ def cmd_serve(args) -> int:
           f"[wmrm]   state : {cfg.state_dir}\n"
           f"[wmrm]   input : {input_note}\n"
           f"[wmrm]   r2    : {r2_note}\n"
+          f"[wmrm]   mezon : {mezon_note}\n"
           f"[wmrm]   disk  : refuse below {cfg.min_free_gb:g} GiB free\n"
           f"[wmrm]   jobs  : {cfg.max_concurrent} at a time\n"
           f"[wmrm] serving on {args.host}:{args.port}  (docs at /docs)",
