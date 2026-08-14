@@ -907,6 +907,8 @@ Saving re-probes immediately, so you find out on that screen whether the two now
 | `WMRM_LOCAL_INPUT_ROOT` | no | unset. Required only for `input.kind: "local"`. |
 | `WMRM_MIN_FREE_GB` | no | 50 on a pod, 2 elsewhere |
 | `WMRM_MAX_CONCURRENT` | no | 1 |
+| `WMRM_RECLAIM` | no | on. `off` keeps every finished job's files; see [Getting the disk back](#getting-the-disk-back) |
+| `WMRM_RETENTION_HOURS` | no | 48. How long a job that did **not** deliver keeps its files |
 | `R2_*` | for `kind: "r2"` | unset. See [`wmrm pull`](#getting-the-file--wmrm-pull) — the same four. |
 | `WMRM_MEZON_WEBHOOK_URL` | no | unset. A Mezon channel webhook; see [Telling a person](#telling-a-person-mezon) |
 | `WMRM_ECHO_RUN` / `WMRM_RUN_LOG` | no | see [Watching a run](#watching-a-run) |
@@ -1019,6 +1021,54 @@ nobody opens.
 parts in `<output>.parts/`, and `ppPart` defaults to 3600 frames — so a one-minute clip is
 a single part and there is nothing to count. It only becomes informative on long footage:
 two hours at 30 fps is about 60 parts.
+
+### Getting the disk back
+
+**A job's files are deleted as soon as its output is in R2.** One 4K feature is ~18 GB in
+and ~9 GB out, so without this the third job on a 100 GB volume is refused with 507 for
+want of space held entirely by work nobody will look at again.
+
+What goes and what stays:
+
+| | |
+| --- | --- |
+| the downloaded source, the output, any leftover `<output>.parts/` | **deleted** |
+| `report.json`, the detect preview and zoom, the preset | kept — a few MB, and they are the answer to "what box was this actually made with" |
+| the job's state file under `WMRM_STATE` | kept. `GET /jobs/{id}` keeps working, with `reclaimedAt` set |
+
+The trigger is **the output key, not the state**. `outputKey` is only set once `push_r2`
+returns, so a job whose output was deliberately left on disk — `output.kind: "local"`, or a
+pod with no credentials — keeps the only copy there is. So does `upload_failed`, which is
+the whole point of that outcome: the video passed verification and only delivery failed, so
+retrying costs one upload rather than nine hours of GPU time.
+
+A sweep every 15 minutes, and once at startup, covers what that misses:
+
+- a pod killed between the upload and the delete
+- anything else terminal, once it is older than `WMRM_RETENTION_HOURS` (48). This is the
+  window that matters for `interrupted`: its `<output>.parts/` is what `--resume` picks up,
+  so deleting early turns a retry that costs minutes into one that costs the whole run
+- directories in the work dir that no job claims at all — a half-done `DELETE`, a wiped
+  state directory, a changed `WMRM_POD_ID`. Nothing else in the system will ever mention
+  them again
+- **below `WMRM_MIN_FREE_GB` it stops waiting.** The floor means the pod is already
+  refusing work, so the window is overridden — delivered outputs first, `interrupted` last
+  and with a line in the log saying its parts are going
+
+A local input is never touched: it lives outside the job directory, and only what is inside
+one is ever deleted (resolved first, so a symlink or a hand-edited state file cannot aim it
+somewhere else).
+
+`GET /health` reports `disk.heldGb` alongside `workDirFreeGb`, because "the volume is
+filling up" and "the volume is full of my own leftovers" send you somewhere completely
+different. `WMRM_RECLAIM=off` turns all of it off and leaves `DELETE /jobs/{id}` as the
+only way space comes back.
+
+```
+[job job_01J...] succeeded (outcome=ok) -> output/job_01J.../4K_MOGI-130-clean.mp4
+[job job_01J...] reclaimed 26.3 GiB -- the source and the output are gone from this pod,
+                 the output is in R2. The report and previews stay.
+```
 
 ### What the pod tells you
 
@@ -1154,8 +1204,12 @@ machine that is merely asleep would mean typing everything again once it wakes u
 
 No queue. The pod takes one job at a time and answers **409** when it is busy — deciding
 what runs next is the scheduler's job, and a queue on both sides is two queues to
-disagree. No retries of its own, for the same reason. No cleanup of old work directories
-beyond `DELETE /jobs/{id}`.
+disagree. No retries of its own, for the same reason.
+
+It does clean up after itself — see [Getting the disk back](#getting-the-disk-back) — but
+only its own work directory. Objects in R2 are never deleted by a pod: the control plane
+owns their lifecycle, and a worker deleting outputs is a worker that can lose the job it
+was paid to do.
 
 ---
 

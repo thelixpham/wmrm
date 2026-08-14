@@ -129,6 +129,8 @@ class JobRecord:
             "updatedAt": d.get("updatedAt"),
             "startedAt": d.get("startedAt"),
             "finishedAt": d.get("finishedAt"),
+            "reclaimedAt": d.get("reclaimedAt"),
+            "reclaimedBytes": d.get("reclaimedBytes"),
         }
 
 

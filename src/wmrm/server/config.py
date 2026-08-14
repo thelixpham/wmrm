@@ -77,6 +77,7 @@ class Config:
     local_input_root: Path | None
     max_concurrent: int
     min_free_gb: float
+    retention_hours: float
     r2_bucket: str | None
     r2_workers: int
     mezon_webhook_url: str | None
@@ -112,6 +113,16 @@ class Config:
             # the first thing anyone had to do was override it.
             min_free_gb=float(os.environ.get("WMRM_MIN_FREE_GB")
                               or (50 if on_pod() else 2)),
+            # How long a job that did *not* deliver keeps its files. A delivered output is
+            # reclaimed at once -- R2 has it -- so this window only ever protects the case
+            # that needs protecting: an interrupted run whose `<output>.parts/` is what
+            # `--resume` picks up, where deleting early turns a retry that costs minutes
+            # into one that costs the whole run again.
+            #
+            # 48 hours because that is a working day plus a night: long enough that a
+            # failure found on Monday morning is still resumable, short enough that a
+            # weekend of them does not fill the volume.
+            retention_hours=float(os.environ.get("WMRM_RETENTION_HOURS") or "48"),
             r2_bucket=os.environ.get("R2_BUCKET") or os.environ.get("S3_BUCKET") or None,
             # 8 is where `wmrm pull` settled: past that the link or the disk saturates
             # first, so more workers only add connections.

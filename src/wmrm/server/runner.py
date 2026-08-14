@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import reclaim
 from .config import Config
 from .hooks import Notifier
 from .models import JobSpec
@@ -286,6 +287,8 @@ class JobRunner:
                 _say(spec.jobId, "WARNING: could not report the result back. "
                                  "The state above is on disk; the caller has not been told.")
 
+            await self._reclaim(spec, rec)
+
         except asyncio.CancelledError:                  # pragma: no cover
             raise
         except (NotEnoughSpace, TransferError, ValueError) as exc:
@@ -303,6 +306,30 @@ class JobRunner:
             # Dropped only now the job is terminal: until then `cancel` and `/jobs/{id}`
             # must see the same object this loop is writing.
             self._records.pop(spec.jobId, None)
+
+    async def _reclaim(self, spec: JobSpec, rec: JobRecord) -> None:
+        """Give the disk back, now the result is delivered and reported.
+
+        **After the webhook, not before.** The control plane learning the job is done is
+        what releases the queue behind it; freeing 26 GB first would delay that by however
+        long the unlinks take on a busy volume. A pod that dies in between leaves the files
+        for the sweep, which is exactly the case the sweep exists for.
+
+        **Never allowed to fail the job.** This runs inside the try that publishes the
+        result, so an unexpected error here would land in `_fail` and rewrite a `succeeded`
+        job as `internal` -- reporting a failure for work that is finished, verified and
+        already in R2. The bytes are a housekeeping problem; the state is not.
+        """
+        try:
+            freed = await asyncio.to_thread(reclaim.after_delivery, self.cfg, rec)
+        except Exception as exc:                            # noqa: BLE001
+            _say(spec.jobId, f"note: could not reclaim the work directory: "
+                             f"{type(exc).__name__}: {exc}")
+            return
+        if freed:
+            _say(spec.jobId,
+                 f"reclaimed {reclaim.human(freed)} -- the source and the output are "
+                 f"gone from this pod, the output is in R2. The report and previews stay.")
 
     async def _abort_upload(self, spec: JobSpec) -> None:
         """Drop a half-finished multipart upload for this job's output key.

@@ -326,6 +326,13 @@ class Disk(BaseModel):
     # has to be able to tell that apart from a disk with nothing left on it.
     workDirFreeGb: float | None
     minFreeGb: float
+    #: What this pod's own job directories hold. The figure that says whether a full volume
+    #: is this pod's leftovers or somebody else's.
+    heldGb: float | None = None
+    #: How long a job that did not deliver keeps its files. Delivered outputs go at once.
+    retentionHours: float | None = None
+    #: False when `WMRM_RECLAIM=off`, i.e. nothing is freed except by `DELETE /jobs/{id}`.
+    reclaim: bool = True
 
 
 class R2Status(BaseModel):
@@ -380,6 +387,11 @@ class JobStatus(BaseModel):
     updatedAt: float | None = None
     startedAt: float | None = None
     finishedAt: float | None = None
+    #: When this pod deleted the job's source and output from its own disk. Set means the
+    #: files are gone on purpose and `outputKey` is where the result lives -- which is the
+    #: answer to the question a missing 9 GB file otherwise raises.
+    reclaimedAt: float | None = None
+    reclaimedBytes: int | None = None
 
 
 class JobList(BaseModel):

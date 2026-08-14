@@ -13,7 +13,9 @@ Two rules the routes follow:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .. import __version__
+from . import reclaim
 from .auth import require_token
 from .config import GPU_ENGINES, Config
 from .hooks import MezonNotifier, Notifier
@@ -103,6 +106,45 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.state.store = JobStore(cfg.state_dir)
     app.state.runner = JobRunner(cfg, app.state.store)
     app.state.machine = None            # filled on startup: see below
+    app.state.sweeper = None            # the disk sweep, started below
+
+    async def _sweep_forever() -> None:
+        """Free what finished jobs no longer need, for as long as this process lives.
+
+        The runner already reclaims a job's files the moment its output is in R2, so this
+        loop is the backstop rather than the mechanism. It is what covers the cases the
+        runner structurally cannot: a pod killed between the upload and the reclaim, a job
+        that failed and has now waited out its retention window, and directories left by
+        a job whose state file is gone.
+
+        A restart runs it once immediately -- a pod comes back precisely after the kind of
+        event that leaves rubbish behind, and waiting a quarter of an hour to notice means
+        the first dispatch after a restart is the one refused for space.
+        """
+        while True:
+            try:
+                summary = await asyncio.to_thread(
+                    reclaim.sweep, cfg, app.state.store,
+                    say=lambda m: print(m, file=sys.stderr, flush=True))
+                line = reclaim.describe(summary)
+                if line:
+                    print(line, file=sys.stderr, flush=True)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:                       # noqa: BLE001
+                # Housekeeping must never take the server with it.
+                print(f"[reclaim] sweep failed: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+            try:
+                await asyncio.sleep(reclaim.SWEEP_EVERY)
+            except asyncio.CancelledError:
+                return
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        task = app.state.sweeper
+        if task is not None and not task.done():
+            task.cancel()
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -128,6 +170,16 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 state="interrupted", outcome="interrupted", report=None,
                 error=rec.data.get("error"),
             )
+
+        # Started after adoption, not before: the jobs just marked `interrupted` are the
+        # ones the sweep has to reason about, and a sweep that ran while they still said
+        # `running` would skip every one of them.
+        if reclaim.enabled():
+            app.state.sweeper = asyncio.create_task(_sweep_forever())
+        else:
+            print("[reclaim] WMRM_RECLAIM is off: finished jobs keep their files, and "
+                  "space comes back only from DELETE /jobs/{id}.",
+                  file=sys.stderr, flush=True)
 
     # ------------------------------------------------------- validation errors --
 
@@ -181,9 +233,18 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             # stand-in number: the control plane shows this figure to a person deciding
             # whether to queue work, and a plausible-looking 0.0 is the one answer that
             # sends them looking for space they already have.
+            # `heldGb` is what this pod's own jobs are sitting on. Reported because "the
+            # volume is filling up" and "the volume is full of my own leftovers" send an
+            # operator somewhere completely different, and until this existed telling them
+            # apart needed a shell on the pod.
             "disk": {"workDirPath": str(cfg.work_dir),
                      "workDirFreeGb": _round_or_none(free_gb(cfg.work_dir)),
-                     "minFreeGb": cfg.min_free_gb},
+                     "minFreeGb": cfg.min_free_gb,
+                     "heldGb": _round_or_none(
+                         await anyio.to_thread.run_sync(
+                             lambda: reclaim.held_bytes(cfg.work_dir) / (1024 ** 3))),
+                     "retentionHours": cfg.retention_hours,
+                     "reclaim": reclaim.enabled()},
             # Whether this pod can fetch and publish objects itself. The control plane
             # reads this to decide which input/output kinds it may ask for, instead of
             # finding out from a failed job.
@@ -263,9 +324,32 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                              f"-- the {cfg.min_free_gb:g} GiB floor is not applied. "
                              f"A full disk will surface as a failed job instead.")
         elif free < cfg.min_free_gb:
+            # Sweep before refusing, not on a timer alone. This is the one moment the
+            # answer matters: the space held by finished jobs is worthless and the request
+            # in hand is real, so turning it away while sitting on 26 GB of delivered
+            # output -- because the next tick is eleven minutes off -- is a refusal nobody
+            # can explain. The sweep is bounded and idempotent; the cost of one here is a
+            # few unlinks.
+            summary = await asyncio.to_thread(
+                reclaim.sweep, cfg, store,
+                say=lambda m: print(m, file=sys.stderr, flush=True))
+            line = reclaim.describe(summary)
+            if line:
+                _say(spec.jobId, line + " -- looking again before refusing")
+            # Explicitly against None: 0.0 GiB free is a real answer, and `or` would
+            # discard it in favour of the stale reading.
+            again = free_gb(cfg.work_dir)
+            if again is not None:
+                free = again
+        if free is not None and free < cfg.min_free_gb:
             raise refuse(507, f"only {free:.1f} GiB free in {cfg.work_dir}, "
                               f"need {cfg.min_free_gb:.0f} GiB "
-                              f"(raise or lower it with WMRM_MIN_FREE_GB)")
+                              + ("-- and finished jobs have already been swept, so this is "
+                                 "space something else is using"
+                                 if reclaim.enabled()
+                                 else "-- WMRM_RECLAIM is off, so finished jobs are still "
+                                      "holding their files")
+                              + " (raise or lower the floor with WMRM_MIN_FREE_GB)")
 
         # Refused here rather than discovered by the job. A pod without credentials
         # cannot fetch a key or publish a result, and finding that out after the job is

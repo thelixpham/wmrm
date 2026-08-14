@@ -557,6 +557,13 @@ def cmd_serve(args) -> int:
     if not cfg.r2_configured:
         r2_note += "  <- kind=r2 jobs will be refused"
     mezon_note = MezonNotifier(cfg.mezon_webhook_url).describe()
+    # Printed because the alternative was discovering it from a 507: a pod that keeps every
+    # job's files is one job away from refusing work, and that is a property of the process
+    # you started, not something to go and read the source for.
+    from .server import reclaim as _reclaim
+    clean_note = (f"delivered jobs at once, everything else after "
+                  f"{cfg.retention_hours:g}h" if _reclaim.enabled()
+                  else "off (WMRM_RECLAIM) -- files stay until DELETE /jobs/{id}")
 
     print(f"[wmrm] pod id : {cfg.pod_id}\n"
           f"[wmrm] machine: {where}\n"
@@ -566,6 +573,7 @@ def cmd_serve(args) -> int:
           f"[wmrm]   r2    : {r2_note}\n"
           f"[wmrm]   mezon : {mezon_note}\n"
           f"[wmrm]   disk  : refuse below {cfg.min_free_gb:g} GiB free\n"
+          f"[wmrm]   clean : {clean_note}\n"
           f"[wmrm]   jobs  : {cfg.max_concurrent} at a time\n"
           f"[wmrm] serving on {args.host}:{args.port}  (docs at /docs)",
           file=sys.stderr)
