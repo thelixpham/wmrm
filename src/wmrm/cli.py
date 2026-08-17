@@ -425,8 +425,8 @@ def _coverage_ring(box: Box, override: int | None = None) -> int:
     return max(1, override) if override else max(48, min(box.w, 200))
 
 
-def _grow_to_cover(src: Path, box: Box, *, grow: bool, ring: int | None = None,
-                   samples: int | None = None) -> tuple[Box, "object"]:
+def _grow_to_cover(src: Path, box: Box, *, grow: bool,
+                   ring: int | None = None) -> tuple[Box, "object"]:
     """Measure coverage, and while the box is short, grow it and measure again.
 
     Detection under-reaches on a mark whose two halves differ in contrast: it locks onto
@@ -439,19 +439,25 @@ def _grow_to_cover(src: Path, box: Box, *, grow: bool, ring: int | None = None,
     """
     from .coverage import check_coverage
 
-    # `samples` is forwarded; `persistence` and `grad_threshold` deliberately are not,
-    # even though `run` accepts both. They mean the opposite thing here: on detection
-    # they tune what gets *found*, and forwarding them would tune what the safety net is
-    # allowed to *see*. Both of `run`'s defaults are the tighter ones (0.90 against the
-    # check's 0.85, and a swept threshold that usually settles above the check's fixed
-    # 2.0), so forwarding them would make the net blinder than its own defaults -- and
-    # the failure that costs money is the one where it misses a fringe, not the one
-    # where it complains.
-    extra = {"samples": samples} if samples else {}
-
+    # None of `run`'s detection knobs are forwarded -- not `persistence`, not
+    # `grad_threshold`, and **not `samples`**. They tune what detection *finds*;
+    # forwarding them tunes what the safety net is allowed to *see*, and every one of
+    # `run`'s defaults is the tighter of the two.
+    #
+    # `samples` is the counter-intuitive one and it was forwarded here once, which is
+    # how this comment came to be written. More frames is not more evidence: the check
+    # requires a pixel to clear the threshold in >=85% of them, and 40 frames drawn
+    # across a whole film cover more varied backgrounds than 30, so a faint glyph misses
+    # in more of them. Measured on MOGI-108, box 1654,45,183,63, which is 94 px short --
+    # same file, same box, only the sample count differs:
+    #
+    #     ring 200, samples 30 -> 924 px flagged -> UNDER-COVERED, reach left +94
+    #     ring 183, samples 40 -> 378 px flagged -> under the noise floor -> "covered"
+    #
+    # More samples made the net blinder and passed a box with watermark still in it.
     rounds = _GROW_ROUNDS if grow else 1
     for attempt in range(rounds):
-        cov = check_coverage(src, box, ring=_coverage_ring(box, ring), **extra)
+        cov = check_coverage(src, box, ring=_coverage_ring(box, ring))
         print(cov.describe(), file=sys.stderr)
         # `attempt == rounds - 1` matters: the box returned has to be the box this
         # verdict was measured on. Growing on the last pass would hand back a box
@@ -479,8 +485,7 @@ def _grow_to_cover(src: Path, box: Box, *, grow: bool, ring: int | None = None,
 
 
 def _run_coverage_gate(src: Path, box: Box, mode: str, report, *,
-                       grow: bool = False, ring: int | None = None,
-                       samples: int | None = None) -> Box:
+                       grow: bool = False, ring: int | None = None) -> Box:
     """Check the box covers the whole mark, before a single frame is processed.
 
     `run` did not do this before -- only `batch` did, and only when it had detected the
@@ -500,7 +505,7 @@ def _run_coverage_gate(src: Path, box: Box, mode: str, report, *,
     if mode == "off":
         return box
 
-    box, cov = _grow_to_cover(src, box, grow=grow, ring=ring, samples=samples)
+    box, cov = _grow_to_cover(src, box, grow=grow, ring=ring)
     if report is not None:
         report.set_coverage(cov)
 
@@ -575,8 +580,7 @@ def _cmd_run_inner(args, report) -> int:
     grown = _run_coverage_gate(src, box, "warn" if args.preview_only else gate_mode,
                                report,
                                grow=_box_source(args) == "detect",
-                               ring=getattr(args, "coverage_ring", None),
-                               samples=getattr(args, "samples", None))
+                               ring=getattr(args, "coverage_ring", None))
     if grown.as_tuple() != box.as_tuple():
         # Keep the preset agreeing with the box actually used. Nothing downstream reads
         # its coordinates today -- they are resolved once, above -- but a preset that
@@ -804,8 +808,7 @@ def cmd_batch(args) -> int:
                 # costs, and that is decided below, not here.
                 box, cov = _grow_to_cover(
                     src, box, grow=_box_source(args) == "detect",
-                    ring=getattr(args, "coverage_ring", None),
-                    samples=getattr(args, "samples", None))
+                    ring=getattr(args, "coverage_ring", None))
                 if cov.inconclusive:
                     # The background is static, so no statistic separates mark from
                     # wall. Not a reason to refuse the work -- a reason to say so and

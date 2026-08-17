@@ -57,10 +57,12 @@ class Script:
         self.steps = list(steps)
         self.rings: list[int] = []
         self.boxes: list[tuple[int, int, int, int]] = []
+        self.extra: list[dict] = []
 
     def __call__(self, src, box, *, ring=48, **kw) -> Coverage:
         self.rings.append(ring)
         self.boxes.append(box.as_tuple())
+        self.extra.append(kw)
         nxt = self.steps.pop(0) if self.steps else None
         return verdict(box, nxt)
 
@@ -199,6 +201,26 @@ def test_inconclusive_stops_immediately() -> None:
     check("the caller still sees it was inconclusive", cov.inconclusive)
 
 
+def test_detection_knobs_are_not_forwarded() -> None:
+    """A regression guard, because forwarding `samples` shipped once and broke the gate.
+
+    The check requires a pixel to clear its threshold in >=85% of sampled frames, so a
+    larger sample count spans more varied backgrounds and a faint glyph misses in more
+    of them. Measured on MOGI-108, box 1654,45,183,63, which is 94 px short: at 30
+    samples 924 px were flagged and the verdict was UNDER-COVERED; at 40 samples only
+    378 px were, which is under the noise floor, and it reported "covered" -- passing a
+    box with watermark still in it. More samples is not more evidence here.
+    """
+    print("\n[detection knobs stay out of the gate]")
+    script = Script(None)
+    run(script, Box(1654, 45, 183, 63), grow=True)
+    passed = script.extra[0]
+    for knob in ("samples", "persistence", "grad_threshold"):
+        check(f"{knob} is not forwarded to the check", knob not in passed,
+              f"got {passed}")
+    check("only the ring is", set(passed) == set(), f"got {sorted(passed)}")
+
+
 def test_ring_override_reaches_the_check() -> None:
     print("\n[--coverage-ring]")
     script = Script(None)
@@ -218,6 +240,7 @@ def test_ring_override_reaches_the_check() -> None:
 def main() -> int:
     test_ring_scales_with_box()
     test_saturation_is_reported()
+    test_detection_knobs_are_not_forwarded()
     test_ring_override_reaches_the_check()
     test_grows_until_covered()
     test_multiple_rounds_and_the_cap()
