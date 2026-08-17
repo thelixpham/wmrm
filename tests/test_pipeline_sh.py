@@ -81,8 +81,12 @@ def main() -> int:
     for label, cond in [
         ("detected rather than using a preset", "no preset yet" in res.stdout),
         ("preset saved for next time", (work / "preset.json").exists()),
-        ("outputs moved to outbox", sorted(p.name for p in (work / "outbox").iterdir())
-         == ["a-clean.mp4", "b-clean.mp4"]),
+        # Hidden files are skipped: `output_lock` leaves `.<name>.wmrm-lock` behind on
+        # purpose (unlinking it races with a process that has just opened it and is
+        # about to flock), so an exact listing here would fail on correct behaviour.
+        ("outputs moved to outbox",
+         sorted(p.name for p in (work / "outbox").iterdir()
+                if not p.name.startswith(".")) == ["a-clean.mp4", "b-clean.mp4"]),
         ("inbox originals untouched", sorted(p.name for p in (work / "inbox").glob("*.mp4"))
          == ["a.mp4", "b.mp4"]),
         ("points at a preview to check", "-preview-zoom.png" in res.stdout),

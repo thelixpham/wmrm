@@ -128,6 +128,32 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
     return box, preset
 
 
+def _refresh_detect_artifacts(src: Path, box: Box, preset: Preset) -> None:
+    """Rewrite the preview and the preset record detection left behind.
+
+    Both are written while the box is still detection's guess, which is before the
+    coverage check has had a chance to grow it -- so after a grow they describe a
+    rectangle this run will not use. The preset is the one that bites: its whole purpose
+    is to be handed back with --preset, and the line printed next to it says so. A
+    record that quietly disagrees with the run it came from is worse than no record.
+    """
+    saved = src.with_name(f"{src.stem}-preset.json")
+    preview = src.with_name(f"{src.stem}-preview.png")
+    try:
+        if saved.exists():
+            preset.save(saved)
+        if preview.exists():
+            write_preview(src, box, preview,
+                          zoom_png=preview.with_name(f"{preview.stem}-zoom.png"))
+        print(f"[wmrm] the check grew the box, so {preview.name} and {saved.name} "
+              f"were rewritten to show {box.x},{box.y},{box.w},{box.h}", file=sys.stderr)
+    except (OSError, DetectError) as exc:
+        # Neither is load-bearing for the run itself; a read-only mount is not a reason
+        # to throw away hours of processing.
+        print(f"[wmrm] note: could not refresh {preview.name} / {saved.name}: {exc}",
+              file=sys.stderr)
+
+
 def _box_source(args) -> str:
     """Where the box came from, for the report. Derived, so it cannot disagree."""
     if getattr(args, "box", None):
@@ -341,6 +367,24 @@ def cmd_detect(args) -> int:
         )
         print(det.describe())
         box, roi, opacity = det.box, det.roi, det.opacity
+
+    # The sweep stops at the bold half of a two-part mark -- it selects the largest
+    # *stable* box, and the faint half is revealed a few glyphs per threshold step, so
+    # every box in that range grows by more than the 10% a plateau allows. Measured on
+    # MOGI-108: detection returns 1654,45,183,63 against a mark that starts at 1560, and
+    # even the bottom of the sweep only reaches 1578.
+    #
+    # This command's entire output is a preset someone hands to `run` later, so growing
+    # the box here is the difference between saving a calibration that passes the gate
+    # and saving one that fails it hours from now. `--box` is left alone: that is a
+    # decision, not an estimate. `det.describe()` above still prints the raw detection,
+    # which is what makes a threshold sweep readable.
+    if det is not None:
+        grown, _ = _grow_to_cover(src, box, grow=True)
+        if grown.as_tuple() != box.as_tuple():
+            print(f"\ndetection was short; the coverage check grew the box to "
+                  f"x={grown.x} y={grown.y} w={grown.w} h={grown.h}")
+            box = grown
 
     preview = Path(args.preview) if args.preview else src.with_name(f"{src.stem}-preview.png")
     zoom = preview.with_name(f"{preview.stem}-zoom{preview.suffix}")
@@ -588,6 +632,8 @@ def _cmd_run_inner(args, report) -> int:
         box = grown
         preset = replace(preset, box_norm=(box.x / info.width, box.y / info.height,
                                            box.w / info.width, box.h / info.height))
+        if _box_source(args) == "detect":
+            _refresh_detect_artifacts(src, box, preset)
 
     if args.preview_only:
         out = dst.with_name(f"{src.stem}-boxcheck.png")
