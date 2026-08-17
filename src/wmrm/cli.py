@@ -22,7 +22,7 @@ from .errors import (CoverageInconclusive, CoverageUnder, InputMissing, UsageErr
 from .lock import output_lock
 from .pipeline import EncodeError, EncodeOpts, run_fast, run_inpaint
 from .probe import ProbeError, ToolMissing, probe
-from .region import CORNERS, Box, Preset
+from .region import CORNERS, Box, Preset, corner_search_roi
 from .report import ReportWriter, RunContext
 from .verify import verify as run_verify
 
@@ -128,7 +128,8 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
     return box, preset
 
 
-def _refresh_detect_artifacts(src: Path, box: Box, preset: Preset) -> None:
+def _refresh_detect_artifacts(src: Path, box: Box, preset: Preset,
+                              roi: Box | None = None) -> None:
     """Rewrite the preview and the preset record detection left behind.
 
     Both are written while the box is still detection's guess, which is before the
@@ -143,7 +144,10 @@ def _refresh_detect_artifacts(src: Path, box: Box, preset: Preset) -> None:
         if saved.exists():
             preset.save(saved)
         if preview.exists():
-            write_preview(src, box, preview,
+            # `roi` matters: the orange search-window rectangle is half of what this
+            # image is for. Redrawing without it silently drops evidence -- whether the
+            # mark sat near the edge of the window detection was allowed to look in.
+            write_preview(src, box, preview, roi=roi,
                           zoom_png=preview.with_name(f"{preview.stem}-zoom.png"))
         print(f"[wmrm] the check grew the box, so {preview.name} and {saved.name} "
               f"were rewritten to show {box.x},{box.y},{box.w},{box.h}", file=sys.stderr)
@@ -633,7 +637,15 @@ def _cmd_run_inner(args, report) -> int:
         preset = replace(preset, box_norm=(box.x / info.width, box.y / info.height,
                                            box.w / info.width, box.h / info.height))
         if _box_source(args) == "detect":
-            _refresh_detect_artifacts(src, box, preset)
+            # Recomputed rather than threaded out of `_resolve_region`: it is a pure
+            # function of the frame size and the two flags, so there is nothing to
+            # disagree about, and the alternative is a third return value on a helper
+            # four call sites already unpack.
+            _refresh_detect_artifacts(
+                src, box, preset,
+                roi=corner_search_roi(info.width, info.height,
+                                      getattr(args, "corner", "tr"),
+                                      getattr(args, "roi_frac", 0.30)))
 
     if args.preview_only:
         out = dst.with_name(f"{src.stem}-boxcheck.png")
