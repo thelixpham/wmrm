@@ -22,6 +22,14 @@ from .region import Box
 OUTSIDE_PSNR_FLOOR = 38.0   # below this, the whole frame was degraded
 INSIDE_PSNR_CEIL = 40.0     # above this, nothing was actually changed
 
+# `OUTSIDE_PSNR_FLOOR` is not yet calibrated and is known to be tight. Nothing outside
+# the mask is repainted, so what it actually measures is libx264 loss at the run's crf,
+# which depends on the content: a 2h05m clip that passed scored 39.3 dB, 1.3 dB of
+# margin, and a grainier one is expected to sit lower for no fault of the run. Raising
+# or lowering it from one anecdote would be guessing, so the numbers needed to set it --
+# the spread across frames, and near-band against far-field -- are recorded on every run
+# instead. Set it from those.
+
 
 @dataclass
 class VerifyResult:
@@ -80,7 +88,44 @@ def _mid_frame(path: Path, at: float) -> np.ndarray:
     ).copy()
 
 
-def verify(original: Path, processed: Path, box: Box | None = None) -> VerifyResult:
+def _sample_times(duration: float, n: int) -> list[float]:
+    """Spread the samples, avoiding the very ends where fades and black frames live."""
+    if duration <= 0:
+        return [0.0]
+    return list(np.linspace(duration * 0.05, duration * 0.95, num=max(1, n)))
+
+
+def _measure(fa: np.ndarray, fb: np.ndarray, box: Box) -> tuple[float, float, float, float]:
+    """PSNR inside the box, outside the mask, and outside split into near and far.
+
+    The near/far split is diagnostic, not a verdict. Nothing repaints beyond the box
+    plus dilate and feather (17 px against the 24 px this masks out), so PSNR outside
+    the mask measures the **re-encode**, not damage -- which is why an absolute floor on
+    it is really a floor on how expensive this content is to encode. If the repaint ever
+    did leak, it would show up close to the box and not far from it. Uniform near and far
+    means encode loss; near much worse than far means something escaped the mask.
+    """
+    inside = _psnr(fa[box.y: box.y + box.h, box.x: box.x + box.w],
+                   fb[box.y: box.y + box.h, box.x: box.x + box.w])
+
+    m = 24
+    masked = np.zeros(fa.shape[:2], bool)
+    masked[max(0, box.y - m): box.y + box.h + m,
+           max(0, box.x - m): box.x + box.w + m] = True
+
+    band = 96
+    ring = np.zeros(fa.shape[:2], bool)
+    ring[max(0, box.y - band): box.y + box.h + band,
+         max(0, box.x - band): box.x + box.w + band] = True
+
+    outside = _psnr(fa[~masked], fb[~masked])
+    near = _psnr(fa[ring & ~masked], fb[ring & ~masked])
+    far = _psnr(fa[~ring], fb[~ring])
+    return outside, inside, near, far
+
+
+def verify(original: Path, processed: Path, box: Box | None = None, *,
+           samples: int = 9) -> VerifyResult:
     r = VerifyResult()
     a, b = probe(original), probe(processed)
 
@@ -94,20 +139,42 @@ def verify(original: Path, processed: Path, box: Box | None = None) -> VerifyRes
           f"{'present' if b.has_audio else 'none'}")
 
     if box is not None and r.checks[0][1]:
-        at = max(0.0, min(a.duration, b.duration) / 2)
-        fa, fb = _mid_frame(original, at), _mid_frame(processed, at)
+        dur = min(a.duration, b.duration)
+        outside, inside, near, far = [], [], [], []
+        for at in _sample_times(dur, samples):
+            try:
+                fa, fb = _mid_frame(original, at), _mid_frame(processed, at)
+            except RuntimeError:
+                # One unreadable frame is not a verdict on the file. Only having none
+                # of them is, and that is handled below.
+                continue
+            o, i, n, f = _measure(fa, fb, box)
+            outside.append(o)
+            inside.append(i)
+            near.append(n)
+            far.append(f)
 
-        inside = _psnr(fa[box.y: box.y + box.h, box.x: box.x + box.w],
-                       fb[box.y: box.y + box.h, box.x: box.x + box.w])
-        keep = np.ones(fa.shape[:2], bool)
-        m = 24
-        keep[max(0, box.y - m): box.y + box.h + m,
-             max(0, box.x - m): box.x + box.w + m] = False
-        outside = _psnr(fa[keep], fb[keep])
+        if not outside:
+            r.add("rest of frame preserved", False,
+                  f"could not read any of the {samples} sampled frames")
+            return r
 
-        r.add("rest of frame preserved", outside >= OUTSIDE_PSNR_FLOOR,
-              f"PSNR outside mask {outside:.1f} dB (floor {OUTSIDE_PSNR_FLOOR})")
-        r.add("watermark region changed", inside <= INSIDE_PSNR_CEIL,
-              f"PSNR inside mask {inside:.1f} dB (ceiling {INSIDE_PSNR_CEIL})")
+        med_out, med_in = float(np.median(outside)), float(np.median(inside))
+        # The median, not the single mid-point frame this used to read. A `-ss` seek can
+        # land on different pictures in two files whose keyframes differ -- the output is
+        # re-encoded and, for a long clip, concatenated from many parts -- and on moving
+        # content one frame of misalignment reads as tens of dB of "damage". Deciding a
+        # six-hour run on that one draw was a coin flip; the spread below is what tells
+        # a misread frame (one outlier) from a real one (the whole distribution moves).
+        r.add("rest of frame preserved", med_out >= OUTSIDE_PSNR_FLOOR,
+              f"PSNR outside mask median {med_out:.1f} dB over {len(outside)} frames "
+              f"(min {min(outside):.1f}, max {max(outside):.1f}, "
+              f"floor {OUTSIDE_PSNR_FLOOR})  |  "
+              f"near-band {float(np.median(near)):.1f} vs far-field "
+              f"{float(np.median(far)):.1f} dB")
+        r.add("watermark region changed", med_in <= INSIDE_PSNR_CEIL,
+              f"PSNR inside mask median {med_in:.1f} dB over {len(inside)} frames "
+              f"(min {min(inside):.1f}, max {max(inside):.1f}, "
+              f"ceiling {INSIDE_PSNR_CEIL})")
 
     return r

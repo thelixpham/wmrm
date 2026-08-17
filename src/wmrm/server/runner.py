@@ -62,9 +62,17 @@ def _say(job_id: str, message: str) -> None:
 #: `upload_failed` maps to `failed` but is worth its own outcome: the run produced a file
 #: that passed verification and only the delivery went wrong, so retrying costs one
 #: upload rather than the hours of GPU time that made the file.
+#: `verify_failed` is `needs_review`, not `failed`, because retrying it is pure waste:
+#: same input, same box, same encoder settings produce the same verdict, so the two
+#: remaining attempts spend the whole runtime again to fail identically. Measured: a
+#: 6h20m run would have burned 12h40m more on attempts 2 and 3. It is also the outcome
+#: most likely to be the *check* being wrong rather than the file -- the floor is
+#: absolute while what it measures is dominated by content-dependent encode loss -- and
+#: that is a judgement for a person, which is what `needs_review` is for.
 _OUTCOME_STATE = {
     "ok": "succeeded",
     "coverage_inconclusive": "needs_review",
+    "verify_failed": "needs_review",
     "interrupted": "interrupted",
     "canceled": "canceled",
 }
@@ -242,17 +250,31 @@ class JobRunner:
             outcome = self._decide_outcome(rec, report, code)
 
             output_key = None
-            if outcome == "ok":
+            # `verify_failed` publishes as well, and for the same reason `upload_failed`
+            # exists below: the expensive thing is the GPU hours, not the delivery. The
+            # verify verdict is a threshold on sampled frames, not proof of a broken
+            # file, so when it fires the file is the only evidence that can settle
+            # whether the threshold was wrong or the run was. Dropping it leaves nothing
+            # to diagnose -- measured the hard way, on a 6h20m run whose pod was reclaimed
+            # before anyone could look at the output. The state is `needs_review`, so
+            # nothing downstream mistakes it for a finished job.
+            if outcome in ("ok", "verify_failed"):
                 try:
                     output_key = await self._deliver_output(
                         spec, rec, dst, output_key_plan)
                 except (TransferError, Exception) as exc:      # noqa: BLE001
-                    # The pixels are fine, the delivery is not. Reported as its own
-                    # outcome so the control plane retries the upload rather than the
-                    # nine hours of GPU work that produced the file.
-                    outcome = "upload_failed"
-                    report = report or {}
-                    report["error"] = {"code": outcome, "message": str(exc)}
+                    if outcome == "ok":
+                        # The pixels are fine, the delivery is not. Reported as its own
+                        # outcome so the control plane retries the upload rather than the
+                        # nine hours of GPU work that produced the file.
+                        outcome = "upload_failed"
+                        report = report or {}
+                        report["error"] = {"code": outcome, "message": str(exc)}
+                    else:
+                        # Already going to a human. A failed upload is one more thing for
+                        # them to see, not a different verdict.
+                        _say(spec.jobId,
+                             f"could not publish the unverified output: {exc}")
                     await self._abort_upload(spec)
 
             state = _state_for(outcome)
