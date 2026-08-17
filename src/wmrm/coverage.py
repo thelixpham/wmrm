@@ -55,6 +55,23 @@ class Coverage:
     def ok(self) -> bool:
         return not self.inconclusive and not any(self.reach.values())
 
+    @property
+    def saturated(self) -> bool:
+        """Whether a reach ran out of ring to measure in.
+
+        Nothing outside the ring is ever sampled, so `reach` cannot exceed `ring_px` --
+        see the arithmetic at the bottom of `check_coverage`. When it lands exactly
+        there the mark was still going when the window ran out, which makes the number
+        a floor rather than a distance, and `suggested` a box that is known to be at
+        least this big rather than one known to be big enough. Measured on MOGI-108:
+        at ring 48 this said `left +48` and the suggestion was still 52 px short; at
+        ring 183 it said `left +94` and the suggestion covered the mark.
+
+        A reach that merely reaches the frame edge is not saturated -- there is nothing
+        beyond it for the mark to extend into.
+        """
+        return any(v >= self.ring_px for v in self.reach.values())
+
     def describe(self) -> str:
         x, y, w, h = self.box.as_tuple()
         lines = [f"box checked   : {x},{y},{w},{h}  (ring {self.ring_px}px)"]
@@ -70,10 +87,18 @@ class Coverage:
             lines.append("result        : covered -- nothing mark-like outside the box")
         else:
             sides = ", ".join(f"{k} +{v}px" for k, v in self.reach.items() if v)
-            lines.append(f"result        : UNDER-COVERED -- mark extends {sides}")
+            at_least = " at least" if self.saturated else ""
+            lines.append(f"result        : UNDER-COVERED -- mark extends{at_least} {sides}")
             if self.suggested:
                 sx, sy, sw, sh = self.suggested.as_tuple()
                 lines.append(f"suggested box : {sx},{sy},{sw},{sh}")
+            if self.saturated:
+                lines.append(
+                    f"              : the mark was still going where the {self.ring_px}px "
+                    f"ring ran out, so\n                that reach is a floor and this box "
+                    f"may still be short. Re-check\n                with a wider --ring to "
+                    f"measure how far it actually goes."
+                )
         fired = [n for n, f in (("gradient", self.signal_gradient),
                                 ("low-variance", self.signal_variance)) if f]
         lines.append(f"signals       : {', '.join(fired) if fired else 'none'}")

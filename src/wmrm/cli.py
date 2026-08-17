@@ -401,7 +401,86 @@ def _install_signal_handlers() -> None:
             pass
 
 
-def _run_coverage_gate(src: Path, box: Box, mode: str, report) -> None:
+# How many times the box may be grown from the check's own measurement, and how far a
+# single round may take it.
+_GROW_ROUNDS = 4
+_GROW_LIMIT = 4.0                 # one round may not more than quadruple the area
+
+
+def _coverage_ring(box: Box, override: int | None = None) -> int:
+    """How far past the box to look for leftover mark.
+
+    The check samples a ring this wide, so it cannot see -- and its `reach` cannot
+    report -- anything further out. Against a two-part mark whose faint half detection
+    missed, a narrow ring therefore returns a floor rather than a distance. Measured on
+    MOGI-108, where detection returned the bold badge alone (1654,45,183,63) and the
+    mark in fact starts 101 px further left:
+
+        ring 48   -> "left +48"   the cap, i.e. blind   -> grown box still 52 px short
+        ring 183  -> "left +94"   an actual measurement -> grown box covered, 0.00%
+
+    So it scales with the box. Capped because the sampled window is
+    (w + 2*ring) x (h + 2*ring) and both time and memory scale with its area.
+    """
+    return max(1, override) if override else max(48, min(box.w, 200))
+
+
+def _grow_to_cover(src: Path, box: Box, *, grow: bool, ring: int | None = None,
+                   samples: int | None = None) -> tuple[Box, "object"]:
+    """Measure coverage, and while the box is short, grow it and measure again.
+
+    Detection under-reaches on a mark whose two halves differ in contrast: it locks onto
+    the bold half and the faint one falls outside the box. The check already measures how
+    far outside, so failing and asking a human to re-run with a bigger box was throwing
+    away an answer we were holding. Measured on MOGI-108 this converges in one round.
+
+    Returns the final box together with the verdict that goes with it, and leaves the
+    caller to decide what a still-short box means -- `run` stops, `batch` skips the file.
+    """
+    from .coverage import check_coverage
+
+    # `samples` is forwarded; `persistence` and `grad_threshold` deliberately are not,
+    # even though `run` accepts both. They mean the opposite thing here: on detection
+    # they tune what gets *found*, and forwarding them would tune what the safety net is
+    # allowed to *see*. Both of `run`'s defaults are the tighter ones (0.90 against the
+    # check's 0.85, and a swept threshold that usually settles above the check's fixed
+    # 2.0), so forwarding them would make the net blinder than its own defaults -- and
+    # the failure that costs money is the one where it misses a fringe, not the one
+    # where it complains.
+    extra = {"samples": samples} if samples else {}
+
+    rounds = _GROW_ROUNDS if grow else 1
+    for attempt in range(rounds):
+        cov = check_coverage(src, box, ring=_coverage_ring(box, ring), **extra)
+        print(cov.describe(), file=sys.stderr)
+        # `attempt == rounds - 1` matters: the box returned has to be the box this
+        # verdict was measured on. Growing on the last pass would hand back a box
+        # nothing ever checked, carrying the previous box's verdict.
+        if not grow or cov.ok or cov.inconclusive or attempt == rounds - 1:
+            break
+        s = cov.suggested
+        if s is None or s.as_tuple() == box.as_tuple():
+            break
+        # A box that suddenly quadruples is the check latching onto background structure
+        # -- a window frame, a curtain seam -- rather than the mark. `reach` is the
+        # bounding box of every flagged pixel with no clustering behind it, so one stray
+        # static edge is enough to produce it. Report the box as short rather than
+        # repaint a quarter of the frame on that evidence.
+        if s.area() > _GROW_LIMIT * box.area():
+            print(f"[wmrm] coverage: not growing {box.x},{box.y},{box.w},{box.h} -> "
+                  f"{s.x},{s.y},{s.w},{s.h} ({s.area() / box.area():.1f}x the area) -- "
+                  f"that reads as background, not mark", file=sys.stderr)
+            break
+        print(f"[wmrm] coverage: box was short, growing {box.x},{box.y},{box.w},{box.h}"
+              f" -> {s.x},{s.y},{s.w},{s.h} and checking again", file=sys.stderr)
+        box = s
+
+    return box, cov
+
+
+def _run_coverage_gate(src: Path, box: Box, mode: str, report, *,
+                       grow: bool = False, ring: int | None = None,
+                       samples: int | None = None) -> Box:
     """Check the box covers the whole mark, before a single frame is processed.
 
     `run` did not do this before -- only `batch` did, and only when it had detected the
@@ -413,14 +492,15 @@ def _run_coverage_gate(src: Path, box: Box, mode: str, report) -> None:
     measurement behind that. `warn` reports the same verdict and carries on, which keeps
     every existing invocation behaving as it did while still putting the verdict in the
     report where a caller can act on it.
+
+    Returns the box to process with. That is the box passed in, unless `grow` was asked
+    for and the check found the mark extending past it -- only detection's guesses are
+    grown, because a box a human typed is a decision, not an estimate.
     """
     if mode == "off":
-        return
+        return box
 
-    from .coverage import check_coverage
-
-    cov = check_coverage(src, box)
-    print(cov.describe(), file=sys.stderr)
+    box, cov = _grow_to_cover(src, box, grow=grow, ring=ring, samples=samples)
     if report is not None:
         report.set_coverage(cov)
 
@@ -430,7 +510,7 @@ def _run_coverage_gate(src: Path, box: Box, mode: str, report) -> None:
         if not cov.ok:
             print("[wmrm] --coverage-gate warn: continuing despite the verdict above",
                   file=sys.stderr)
-        return
+        return box
 
     if cov.inconclusive:
         raise CoverageInconclusive(
@@ -441,10 +521,18 @@ def _run_coverage_gate(src: Path, box: Box, mode: str, report) -> None:
     if not cov.ok:
         s = cov.suggested
         hint = f" Try --box {s.x},{s.y},{s.w},{s.h}" if s else ""
+        # Saying "try this box" about a box measured against the edge of the window is
+        # how a caller ends up retrying the same failure: the number was a floor, so the
+        # suggestion is known to be too small rather than known to be enough.
+        if cov.saturated and s:
+            hint += (f" -- but the mark was still going where the {cov.ring_px}px ring "
+                     f"ran out, so that box is a lower bound. Widen it further, or "
+                     f"re-measure with --coverage-ring {2 * cov.ring_px}")
         raise CoverageUnder(
             f"UNDER-COVERED -- the watermark extends outside this box, so processing "
             f"it would ship a video with fringe left in.{hint}"
         )
+    return box
 
 
 def cmd_run(args) -> int:
@@ -474,6 +562,29 @@ def _cmd_run_inner(args, report) -> int:
     if report is not None:
         report.set_paths(src, dst)
 
+    # Before the lock and before the fit: both cost real time, and a box that fails the
+    # gate is not going to be processed with either of them.
+    #
+    # Also before --preview-only, which it did not used to be. The check can now grow the
+    # box, so a preview drawn before it runs shows a rectangle the run would not have
+    # used -- and the whole point of the preview is to show the box that will be used.
+    # It never blocks there: a preview is what you ask for precisely when you want to
+    # look at a box the check is unhappy about, and stopping before drawing it would
+    # withhold the one thing that answers the question.
+    gate_mode = getattr(args, "coverage_gate", "strict")
+    grown = _run_coverage_gate(src, box, "warn" if args.preview_only else gate_mode,
+                               report,
+                               grow=_box_source(args) == "detect",
+                               ring=getattr(args, "coverage_ring", None),
+                               samples=getattr(args, "samples", None))
+    if grown.as_tuple() != box.as_tuple():
+        # Keep the preset agreeing with the box actually used. Nothing downstream reads
+        # its coordinates today -- they are resolved once, above -- but a preset that
+        # says one thing while the run does another is a trap for whoever saves it next.
+        box = grown
+        preset = replace(preset, box_norm=(box.x / info.width, box.y / info.height,
+                                           box.w / info.width, box.h / info.height))
+
     if args.preview_only:
         out = dst.with_name(f"{src.stem}-boxcheck.png")
         write_preview(src, box, out, zoom_png=out.with_name(f"{src.stem}-boxcheck-zoom.png"))
@@ -481,10 +592,6 @@ def _cmd_run_inner(args, report) -> int:
         if report is not None:
             report.ok(dst=None)
         return 0
-
-    # Before the lock and before the fit: both cost real time, and a box that fails the
-    # gate is not going to be processed with either of them.
-    _run_coverage_gate(src, box, getattr(args, "coverage_gate", "strict"), report)
 
     with output_lock(dst, enabled=not getattr(args, "no_lock", False)):
         backend = _make_backend(args, src=src, box=box, preset=preset, report=report)
@@ -691,9 +798,14 @@ def cmd_batch(args) -> int:
                 box, preset = _resolve_region(args, info.width, info.height, src=src)
 
             if gate:
-                from .coverage import check_coverage
-                cov = check_coverage(src, box)
-                print(cov.describe(), file=sys.stderr)
+                # Same loop as `run`, for the same reason: a box detection guessed too
+                # small is worth growing from the check's own measurement rather than
+                # skipping the file over. What differs is only what a still-short box
+                # costs, and that is decided below, not here.
+                box, cov = _grow_to_cover(
+                    src, box, grow=_box_source(args) == "detect",
+                    ring=getattr(args, "coverage_ring", None),
+                    samples=getattr(args, "samples", None))
                 if cov.inconclusive:
                     # The background is static, so no statistic separates mark from
                     # wall. Not a reason to refuse the work -- a reason to say so and
@@ -949,6 +1061,15 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
                         "check cannot tell (use this for unattended runs); off = skip "
                         "the check. The check is one sampling pass, so it is not a "
                         "speed lever")
+    # The one knob that decides whether the check measures or merely reports a floor,
+    # and until now it existed only on `wmrm coverage` -- so the commands that act on
+    # the verdict could not widen the window the verdict came from.
+    p.add_argument("--coverage-ring", type=int, default=None, metavar="PX",
+                   help="how far past the box to look for leftover mark. Default: the "
+                        "box width, floored at 48 and capped at 200. Nothing outside "
+                        "this ring is sampled, so a mark that extends further is "
+                        "reported as reaching exactly this far and no more -- widen it "
+                        "when the verdict says the reach is a floor")
     p.add_argument("--detect", action="store_true",
                    help="find the watermark and process in one go, no preset needed. "
                         "For 'batch' it detects once on the first file and applies "

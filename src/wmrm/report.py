@@ -113,10 +113,17 @@ def coverage_to_dict(cov) -> dict:
     `signal_gradient` and `signal_variance` are **booleans** -- which signal fired,
     not how strongly. They have been written up as floats before; a reader that
     expects a number gets `true` and silently mis-renders it.
+
+    `saturated` is here because without it `reach` and `suggested` are unreadable: a
+    reach of 48 with a 48px ring means "at least 48, the window ran out", and a caller
+    that retries with `suggested` gets the same failure again. The distinction was
+    documented for humans in the README and invisible to every machine consumer, which
+    is how a service ends up looping on a suggestion that was never big enough.
     """
     return {
         "ok": bool(cov.ok),
         "inconclusive": bool(cov.inconclusive),
+        "saturated": bool(cov.saturated),
         "ring_px": int(cov.ring_px),
         "residual_fraction": float(cov.residual_fraction),
         "reach": {k: int(v) for k, v in cov.reach.items()},

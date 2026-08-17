@@ -148,6 +148,9 @@ def test_serializers() -> None:
         signal_variance = False
         inconclusive = False
         ok = False
+        # reach 48 against a 48px ring: the mark was still going where the window ran
+        # out, so the number is a floor and `suggested` is a lower bound.
+        saturated = True
 
     d = coverage_to_dict(FakeCoverage())
     check("signal_gradient serializes as a bool",
@@ -155,6 +158,8 @@ def test_serializers() -> None:
     check("signal_variance serializes as a bool",
           isinstance(d["signal_variance"], bool), repr(d["signal_variance"]))
     check("ring_px serializes as an int", isinstance(d["ring_px"], int))
+    check("saturated serializes as a bool, so a caller can tell a floor from a distance",
+          d["saturated"] is True, repr(d["saturated"]))
     check("reach values are ints", all(isinstance(v, int) for v in d["reach"].values()))
     check("suggested becomes an object", d["suggested"] == {"x": 5, "y": 6, "w": 7, "h": 8})
     check("the whole thing is JSON-serialisable", json.dumps(d) is not None)
