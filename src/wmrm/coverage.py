@@ -106,6 +106,55 @@ class Coverage:
         return "\n".join(lines)
 
 
+def _side_reach(marklike: np.ndarray, box: Box, outer: Box,
+                band_density: float) -> dict[str, int]:
+    """How far the mark reaches past each side, one 1px band at a time.
+
+    Per side, walk outward from the box edge and measure what fraction of each band is
+    flagged, counting only the band's overlap with the box's own span on the other axis.
+    The reach is the furthest band that clears `band_density`.
+
+    This replaced the bounding box of every flagged pixel in the ring, which had no
+    clustering behind it at all: one stray static pixel anywhere in a corner set that
+    side's reach to the corner's distance. Measured on a badge-only box, 1720,44,116,62,
+    against the per-band profiles for the same frames:
+
+        side     old rule   band profile                                   honest reach
+        left       +94      ~0 to d=42, then 0.08-0.21 across d=43..64      ~93
+        right      +84      0.00 in every one of its 84 bands                  0
+        top        +44      0.07-0.25 across d=17..44                        ~41
+        bottom    +116      ~0 everywhere, peak 0.08 at d=4                    ~4
+
+    Two of the four were pure artifact, and they are what made `suggested` come back at
+    9.1x the area -- which `_grow_to_cover`'s runaway guard then refused, so the box was
+    reported short and left short. With the artifact sides gone the suggestion is 3.0x and
+    the grow loop can act on it.
+
+    Gaps are deliberately not treated as the end of the mark: the faint half of a two-part
+    mark sits 42 px of plain background away from the bold half, so any gap tolerance
+    tight enough to be meaningful would stop before reaching it. The ring bounds the
+    search instead.
+    """
+    bx, by = box.x - outer.x, box.y - outer.y
+    rows = slice(by, by + box.h)
+    cols = slice(bx, bx + box.w)
+    h, w = marklike.shape
+    bands = {
+        "left": [marklike[rows, bx - d] for d in range(1, bx + 1)],
+        "right": [marklike[rows, bx + box.w - 1 + d]
+                  for d in range(1, w - (bx + box.w) + 1)],
+        "top": [marklike[by - d, cols] for d in range(1, by + 1)],
+        "bottom": [marklike[by + box.h - 1 + d, cols]
+                   for d in range(1, h - (by + box.h) + 1)],
+    }
+    out = {}
+    for side, bs in bands.items():
+        hits = [d for d, band in enumerate(bs, 1)
+                if band.size and band.mean() >= band_density]
+        out[side] = max(hits) if hits else 0
+    return out
+
+
 def check_coverage(
     src: Path,
     box: Box,
@@ -117,6 +166,19 @@ def check_coverage(
     variance_ratio: float = 0.45,
     min_fraction: float = 0.004,
     max_fraction: float = 0.40,
+    # Fraction of a 1px band that must look mark-like for the mark to be judged to reach
+    # that far. Chosen from measurement, against the two cases that pull opposite ways --
+    # a correct box must come back covered or the strict gate blocks good jobs, and a
+    # known-short box must still be caught or the net is blind:
+    #
+    #     floor    correct boxes (4 clips)   short box, input   short box, test
+    #     0.02     covered                   left +93           left +93
+    #     0.05     covered                   left +83           left +89
+    #     0.10     covered                   left +67           COVERED  <-- blind
+    #
+    # 0.10 and above lose a box that is 167 px short, which is the exact failure this
+    # module exists to catch. 0.05 keeps both and still drops the artifact sides.
+    band_density: float = 0.05,
 ) -> Coverage:
     info = probe(src)
     box = box.clamp(info.width, info.height)
@@ -167,12 +229,7 @@ def check_coverage(
 
     # A handful of stray pixels is noise, not a missed glyph.
     if not inconclusive and fraction >= min_fraction and residual.any():
-        ys, xs = np.nonzero(residual)
-        bx, by = box.x - outer.x, box.y - outer.y
-        reach["left"] = max(0, bx - int(xs.min()))
-        reach["right"] = max(0, int(xs.max()) - (bx + box.w - 1))
-        reach["top"] = max(0, by - int(ys.min()))
-        reach["bottom"] = max(0, int(ys.max()) - (by + box.h - 1))
+        reach = _side_reach(marklike, box, outer, band_density)
         if any(reach.values()):
             suggested = Box(
                 box.x - reach["left"], box.y - reach["top"],

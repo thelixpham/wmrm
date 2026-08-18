@@ -12,7 +12,8 @@ The behaviour under test, and why each part of it exists:
   enough on a mark whose faint half detection missed -- measured on MOGI-108, detection
   returned 1654,45,183,63 against a mark starting 101 px further left, `ring=48` reported
   the cap and `ring=183` measured +94.
-- Growing applies to detection's guesses only. A box a human typed is a decision.
+- Growing applies to guesses only, and a preset is a guess -- it is detection's output
+  saved to a file. A box a human typed is a decision, and stays untouched.
 - A round that quadruples the area is the check latching onto background structure, not
   mark: `reach` is the bounding box of every flagged pixel with no clustering behind it,
   so a single static edge produces it.
@@ -237,8 +238,52 @@ def test_ring_override_reaches_the_check() -> None:
           f"rings {script.rings}")
 
 
+def test_a_preset_is_a_guess_and_gets_grown() -> None:
+    """Which box sources `auto` is allowed to grow.
+
+    A preset used to be excluded, which switched the whole loop above off for the
+    invocation `run.sh` uses: `--preset` with a badge-only box measured UNDER-COVERED,
+    printed the verdict, and processed anyway. The file is not a decision -- it is
+    whatever detection guessed the day someone ran it, and a guess that measured short
+    once measures short every time it is reused.
+    """
+    from argparse import Namespace
+
+    print("\n[which sources grow]")
+
+    def args(**kw):
+        return Namespace(**{"box": None, "preset": None, "coverage_grow": "auto", **kw})
+
+    check("a detected box grows", cli._grow_wanted(args()))
+    check("a preset grows too -- it is a saved guess",
+          cli._grow_wanted(args(preset="wm-preset.json")),
+          "this is the case that shipped a 3h file with the logo still in it")
+    check("a hand-typed --box does not", not cli._grow_wanted(args(box="1720,44,116,62")),
+          "that one is a decision, not an estimate")
+    check("--coverage-grow always overrides that",
+          cli._grow_wanted(args(box="1720,44,116,62", coverage_grow="always")))
+    check("--coverage-grow never turns it off everywhere",
+          not cli._grow_wanted(args(coverage_grow="never")))
+    check("an args object without the flag still behaves as auto",
+          cli._grow_wanted(Namespace(box=None, preset="wm.json")),
+          "batch and the server build args by hand")
+
+
+def test_the_flag_is_wired_to_the_parser() -> None:
+    print("\n[--coverage-grow reaches args]")
+    parser = cli.build_parser()
+    default = parser.parse_args(["run", "in.mp4"])
+    check("it defaults to auto", default.coverage_grow == "auto",
+          f"got {default.coverage_grow!r}")
+    for cmd in ("run", "batch"):
+        got = parser.parse_args([cmd, "in.mp4", "--coverage-grow", "never"])
+        check(f"{cmd} accepts it", got.coverage_grow == "never")
+
+
 def main() -> int:
     test_ring_scales_with_box()
+    test_a_preset_is_a_guess_and_gets_grown()
+    test_the_flag_is_wired_to_the_parser()
     test_saturation_is_reported()
     test_detection_knobs_are_not_forwarded()
     test_ring_override_reaches_the_check()

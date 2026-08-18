@@ -208,12 +208,26 @@ def test_argv_translation() -> None:
     check("resume=false adds --no-resume", "--no-resume" in a_f)
     check("verify=false adds --no-verify", "--no-verify" in a_f)
 
-    # Absent gate means strict for an unattended run, even though the CLI default is warn.
+    # The gate is always stated, and it states the CLI's own default. It used to say
+    # `strict` here, which made a clip the CLI processed into a failed job -- the check
+    # false-positives, so `strict` refused correct work. Safety moved to
+    # `_decide_outcome`, which routes `coverage.ok == false` to needs_review.
     spec_g = JobSpec.model_validate(job_body(
         "argvg", src=FIXTURE, out=Path("/tmp/o.mp4"), options={}))
     a_g = spec_g.argv(input_path="IN", output_path="OUT", report_path="R")
-    check("an absent coverageGate becomes strict",
-          a_g[a_g.index("--coverage-gate") + 1] == "strict")
+    from wmrm.cli import build_parser as _bp
+    cli_default = _bp().parse_args(["run", "x.mp4"]).coverage_gate
+    check("an absent coverageGate becomes the CLI default, not a stricter one",
+          a_g[a_g.index("--coverage-gate") + 1] == cli_default,
+          f"argv says {a_g[a_g.index('--coverage-gate') + 1]!r}, CLI default is "
+          f"{cli_default!r}")
+
+    # An explicit gate still wins, so a caller who does want work refused can ask.
+    spec_s = JobSpec.model_validate(job_body(
+        "argvs", src=FIXTURE, out=Path("/tmp/o.mp4"), options={"coverageGate": "strict"}))
+    a_s = spec_s.argv(input_path="IN", output_path="OUT", report_path="R")
+    check("an explicit strict gate is passed through",
+          a_s[a_s.index("--coverage-gate") + 1] == "strict")
 
     # Every pixel-deciding flag must survive translation, including the three that were
     # missing from an earlier version of this mapping.
@@ -233,6 +247,63 @@ def test_argv_translation() -> None:
         options={"--rm": "-rf", "totallyUnknown": "x"}))
     a_x = spec_x.argv(input_path="IN", output_path="OUT", report_path="R")
     check("unknown option keys are dropped", "-rf" not in a_x and "--rm" not in a_x)
+
+    # The coverage knobs the CLI grew. Both were unreachable from the API, which made the
+    # remedy the under-covered error itself prescribes impossible to apply to a real job.
+    spec_c = JobSpec.model_validate(job_body(
+        "argvc", src=FIXTURE, out=Path("/tmp/o.mp4"),
+        options={"coverageRing": 240, "coverageGrow": "always"}))
+    a_c = spec_c.argv(input_path="IN", output_path="OUT", report_path="R")
+    for flag, value in (("--coverage-ring", "240"), ("--coverage-grow", "always")):
+        check(f"{flag} is translated",
+              flag in a_c and a_c[a_c.index(flag) + 1] == value)
+
+
+def test_every_mapped_flag_exists_on_the_cli() -> None:
+    """Every flag the API can emit must be one `wmrm run` accepts.
+
+    The two tables live in different files and drifted before: `--coverage-ring` was on
+    the CLI and absent here, so a documented remedy could not be reached through the API.
+    Parsing the generated argv is the only check that cannot drift with them -- it fails
+    on a flag that is missing, renamed, or spelled differently.
+    """
+    print("\n[flag parity]")
+    from wmrm.cli import build_parser
+    from wmrm.server.models import _NEGATIVE_FLAGS, _VALUE_FLAGS, JobSpec
+
+    # A representative value per flag, so argparse's own type= does the checking.
+    values = {"corner": "tr", "samples": 30, "roiFrac": 0.3, "gradThreshold": 2.0,
+              "persistence": 0.8, "maxArea": 10.0, "dilate": 5, "feather": 12,
+              "margin": 64, "crf": 18, "x264Preset": "medium", "patchHold": 1,
+              "cacheTolerance": 1.0, "unblendSamples": 40, "threads": 4,
+              "device": "cpu", "ppSegment": 100, "ppPart": 3600, "ppSubvideo": 80,
+              "ppWorkers": 1, "raftIter": 20, "ppMinShot": 16,
+              "ppSceneThreshold": 0.3, "propainter": "/tmp/pp",
+              "coverageGate": "warn", "coverageRing": 200, "coverageGrow": "auto"}
+    unmapped = sorted(set(_VALUE_FLAGS) - set(values))
+    check("this test covers every mapped value flag", not unmapped, f"missing {unmapped}")
+
+    opts = {k: values[k] for k in _VALUE_FLAGS if k in values}
+    opts.update({k: False for k in _NEGATIVE_FLAGS})
+    spec = JobSpec.model_validate(job_body(
+        "parity", src=FIXTURE, out=Path("/tmp/o.mp4"), options=opts))
+    argv = spec.argv(input_path="IN", output_path="OUT", report_path="R")
+    try:
+        build_parser().parse_args(argv[1:])
+        check("wmrm run accepts every flag the API emits", True)
+    except SystemExit:
+        check("wmrm run accepts every flag the API emits", False,
+              f"argparse rejected: {' '.join(argv)}")
+
+    # And the pod's own default must be the library's, not a number copied years ago.
+    from wmrm.detect import DEFAULT_PERSISTENCE
+    bare = JobSpec.model_validate(job_body(
+        "bare", src=FIXTURE, out=Path("/tmp/o.mp4"), options={}))
+    ns = build_parser().parse_args(
+        bare.argv(input_path="IN", output_path="OUT", report_path="R")[1:])
+    check("a job that names no persistence gets the library default",
+          ns.persistence == DEFAULT_PERSISTENCE,
+          f"got {ns.persistence}, DEFAULT_PERSISTENCE is {DEFAULT_PERSISTENCE}")
 
 
 def test_capacity_and_idempotency(tmp: Path) -> None:
@@ -736,6 +807,7 @@ def main() -> int:
         test_hmac()
         test_mezon()
         test_argv_translation()
+        test_every_mapped_flag_exists_on_the_cli()
         test_auth(tmp)
         test_health_shape(tmp)
         test_validation(tmp)

@@ -69,9 +69,16 @@ def _say(job_id: str, message: str) -> None:
 #: most likely to be the *check* being wrong rather than the file -- the floor is
 #: absolute while what it measures is dominated by content-dependent encode loss -- and
 #: that is a judgement for a person, which is what `needs_review` is for.
+#: `coverage_under` is `needs_review` for the same reason as `verify_failed`: the box may
+#: genuinely be short, or the check may be wrong about it, and only a person can say which
+#: from the preview. Retrying is pointless either way -- same input, same box, same
+#: verdict. It exists because the gate now runs as `warn` on this path too, so that the
+#: pod and the CLI process exactly the same jobs; without this the verdict would ride
+#: along in the report and nothing would ever read it, which is how a short box ships.
 _OUTCOME_STATE = {
     "ok": "succeeded",
     "coverage_inconclusive": "needs_review",
+    "coverage_under": "needs_review",
     "verify_failed": "needs_review",
     "interrupted": "interrupted",
     "canceled": "canceled",
@@ -564,6 +571,16 @@ class JobRunner:
         outcome = (report or {}).get("outcome")
         if rec.cancel_requested and outcome in (None, "interrupted", "internal"):
             return "canceled"
+        # A run that finished under `--coverage-gate warn` reports `ok` and puts the
+        # coverage verdict in the report beside it. Reading it here is what stops a box
+        # the check called short from being published as a clean success: `wmrm run`
+        # deliberately does not fail on it (a warn gate that failed would be a strict
+        # gate), so the decision belongs to whoever has somewhere to route it, and this
+        # pod does.
+        if outcome == "ok":
+            cov = (report or {}).get("coverage") or {}
+            if cov.get("ok") is False:
+                return "coverage_under"
         if outcome:
             return str(outcome)
         # No report at all. The process died before it could write one -- killed, or

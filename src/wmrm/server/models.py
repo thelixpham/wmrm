@@ -46,6 +46,12 @@ _VALUE_FLAGS: dict[str, str] = {
     "ppSceneThreshold": "--pp-scene-threshold",
     "propainter": "--propainter",
     "coverageGate": "--coverage-gate",
+    # Both of these existed on the CLI and were unreachable from here, which made two
+    # documented remedies impossible to apply to a real job: the under-covered error
+    # tells the caller to "re-measure with --coverage-ring {2*ring}", and growing is
+    # what actually repairs a short box rather than just reporting it.
+    "coverageRing": "--coverage-ring",
+    "coverageGrow": "--coverage-grow",
 }
 
 #: JSON name -> flag added when the value is **false**. These are the inverted ones.
@@ -252,10 +258,20 @@ class JobSpec(BaseModel):
             argv += ["--box", self.box.as_arg()]
 
         opts = dict(self.options)
-        # A gate is always stated. The CLI default is `warn` because the coverage check
-        # false-positives on this project's own fixture, but an unattended run is exactly
-        # the case that must not ship a maybe -- so absent means strict here, not warn.
-        opts.setdefault("coverageGate", "strict")
+        # A gate is always stated, and it now matches the CLI's default rather than
+        # overriding it. It was `strict` here on the reasoning that an unattended run must
+        # not ship a maybe -- but the effect was that the same clip the CLI processed
+        # happily became a failed job through the API, because the check false-positives.
+        # Measured on five clips at the shipped defaults: four came back covered on both
+        # paths, and the fifth -- a 5s near-static clip -- was reported UNDER-COVERED on a
+        # box that is in fact correct, so `strict` refused work the CLI completed.
+        #
+        # Nothing is given up by matching. The verdict still reaches the report, and
+        # `JobRunner._decide_outcome` turns `coverage.ok == false` into `coverage_under`,
+        # which is `needs_review`: a human still sees every short box, and the difference
+        # is that a *good* box is no longer refused. `strict` remains available per job for
+        # a caller who would rather not spend the GPU time on a maybe.
+        opts.setdefault("coverageGate", "warn")
 
         for name, value in opts.items():
             if value is None:

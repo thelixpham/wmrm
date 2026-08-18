@@ -16,7 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
-from .detect import DetectError, detect, write_preview
+from .detect import DEFAULT_PERSISTENCE, DetectError, detect, write_preview
 from .errors import (CoverageInconclusive, CoverageUnder, InputMissing, UsageError,
                      WmrmError)
 from .lock import output_lock
@@ -78,7 +78,7 @@ def _resolve_region(args, width: int, height: int, *, src: Path | None = None
             samples=getattr(args, "samples", 40),
             roi_frac=getattr(args, "roi_frac", 0.30),
             grad_threshold=getattr(args, "grad_threshold", None),
-            persistence=getattr(args, "persistence", 0.90),
+            persistence=getattr(args, "persistence", DEFAULT_PERSISTENCE),
             max_area_percent=getattr(args, "max_area", 10.0),
         )
         print(det.describe())
@@ -165,6 +165,28 @@ def _box_source(args) -> str:
     if getattr(args, "preset", None):
         return "preset"
     return "detect"
+
+
+def _grow_wanted(args) -> bool:
+    """Whether the coverage check may grow the box it was handed.
+
+    `auto` grows anything detection produced, and a preset counts: it is a detection guess
+    someone saved to a file, not a decision anybody made. This used to test
+    `_box_source(args) == "detect"`, which excluded presets -- and that turned the whole
+    recovery loop off for exactly the invocation `run.sh` uses. Measured on a two-part
+    mark: `--preset` with the 116 px badge-only box measured UNDER-COVERED, printed the
+    verdict, and processed anyway, shipping a 3h file with the studio logo still in the
+    corner. The same box with growing on converges in two rounds, 116 -> 232 -> 283, both
+    inside `_GROW_ROUNDS` and under `_GROW_LIMIT`.
+
+    A box typed by hand is still left alone under `auto` -- that one is a decision, and
+    silently repainting a larger region than was asked for is the wrong way to disagree
+    with it. Pass `always` to grow it too.
+    """
+    mode = getattr(args, "coverage_grow", "auto")
+    if mode in ("always", "never"):
+        return mode == "always"
+    return _box_source(args) in ("detect", "preset")
 
 
 def _log_config(src: Path, dst: Path, info, box: Box, preset: Preset, args,
@@ -627,7 +649,7 @@ def _cmd_run_inner(args, report) -> int:
     gate_mode = getattr(args, "coverage_gate", "strict")
     grown = _run_coverage_gate(src, box, "warn" if args.preview_only else gate_mode,
                                report,
-                               grow=_box_source(args) == "detect",
+                               grow=_grow_wanted(args),
                                ring=getattr(args, "coverage_ring", None))
     if grown.as_tuple() != box.as_tuple():
         # Keep the preset agreeing with the box actually used. Nothing downstream reads
@@ -646,6 +668,17 @@ def _cmd_run_inner(args, report) -> int:
                 roi=corner_search_roi(info.width, info.height,
                                       getattr(args, "corner", "tr"),
                                       getattr(args, "roi_frac", 0.30)))
+        elif _box_source(args) == "preset":
+            # Say it, do not silently rewrite it. The file was named on the command line,
+            # which makes it the caller's input rather than this run's scratch space --
+            # but a preset that measured short once will measure short every time it is
+            # reused, so leaving without a word is how the same too-small box goes on
+            # shipping. Printing the corrected numbers makes fixing it a copy-paste.
+            nx, ny, nw, nh = preset.box_norm
+            print(f"[wmrm] the check grew the box, so {args.preset} is short. This run "
+                  f"uses {box.x},{box.y},{box.w},{box.h}; to make that stick, set its "
+                  f'"box_norm" to [{nx:.9g}, {ny:.9g}, {nw:.9g}, {nh:.9g}] '
+                  f"(or re-detect with no --preset)", file=sys.stderr)
 
     if args.preview_only:
         out = dst.with_name(f"{src.stem}-boxcheck.png")
@@ -865,7 +898,7 @@ def cmd_batch(args) -> int:
                 # skipping the file over. What differs is only what a still-short box
                 # costs, and that is decided below, not here.
                 box, cov = _grow_to_cover(
-                    src, box, grow=_box_source(args) == "detect",
+                    src, box, grow=_grow_wanted(args),
                     ring=getattr(args, "coverage_ring", None))
                 if cov.inconclusive:
                     # The background is static, so no statistic separates mark from
@@ -1089,12 +1122,13 @@ def _add_detect_args(p: argparse.ArgumentParser) -> None:
                         "10 down to 1.5, stopping where the box stops growing -- that "
                         "finds faint marks a fixed threshold misses. Pass a number to "
                         "override")
-    p.add_argument("--persistence", type=float, default=0.90,
-                   help="fraction of sampled frames a pixel must appear in (default "
-                        "0.90). This is what rejects subtitles and temporary text -- "
-                        "and it also rejects a studio logo that is not on screen for "
-                        "the whole film, so lower it when a second mark in the same "
-                        "corner is being missed, and check the box you get")
+    p.add_argument("--persistence", type=float, default=DEFAULT_PERSISTENCE,
+                   help=f"fraction of sampled frames a pixel must appear in (default "
+                        f"{DEFAULT_PERSISTENCE:g}). This is what rejects subtitles and "
+                        f"temporary text. Raising it also rejects a semi-transparent "
+                        f"studio logo that loses its edge over some backgrounds, which "
+                        f"is why the default is not higher -- see DEFAULT_PERSISTENCE "
+                        f"in detect.py for the measurement")
     p.add_argument("--max-area", type=float, default=10.0,
                    help="reject a candidate larger than this %% of the frame (default 10)")
 
@@ -1125,6 +1159,16 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     # The one knob that decides whether the check measures or merely reports a floor,
     # and until now it existed only on `wmrm coverage` -- so the commands that act on
     # the verdict could not widen the window the verdict came from.
+    # Growing is what actually fixes a short box; the gate above only decides what a
+    # still-short box costs. That is why this defaults to doing it rather than to asking:
+    # the failure it prevents is a shipped file with watermark left in, and the cost of
+    # being wrong is repainting a slightly larger rectangle.
+    p.add_argument("--coverage-grow", choices=("auto", "always", "never"),
+                   default="auto",
+                   help="let the check grow a box it measures as too small. auto "
+                        "(default) = grow a detected box or one loaded from a preset, "
+                        "both of which are guesses, but leave a --box you typed alone; "
+                        "always = grow that too; never = only report the verdict")
     p.add_argument("--coverage-ring", type=int, default=None, metavar="PX",
                    help="how far past the box to look for leftover mark. Default: the "
                         "box width, floored at 48 and capped at 200. Nothing outside "
